@@ -57,7 +57,7 @@ type Config struct {
 
 	Agents    int           // agents running a task stream (critical calls)
 	Pollers   int           // the first Pollers agents also poll CI (background calls)
-	TaskPause time.Duration // mean pause between an agent's task calls
+	TaskGap   time.Duration // mean time between the starts of an agent's task calls
 	PollEvery time.Duration // pause between a poller's calls
 	WriteFrac float64       // share of task calls that are writes
 
@@ -102,26 +102,45 @@ type agent struct {
 	retryUntil time.Time
 }
 
-// taskStream sends critical calls one after another: mostly reads, some
-// writes, with a short pause between them.
+// taskStream sends critical calls one after another, mostly reads and some
+// writes, on a schedule: an agent wants a call every TaskGap on average.
+//
+// The wait of each call is measured from when the schedule wanted it, not
+// from when it was finally sent. Otherwise one call stuck for 30s would
+// hide the calls the agent would have wanted during those 30s, and p95
+// would look best exactly when the agent is most stuck ("coordinated
+// omission"). Calls the schedule wanted before the run ended but never
+// sent are recorded as unfinished.
 func (a *agent) taskStream(ctx context.Context, rng *rand.Rand) {
-	// Start at a random point in the first pause, so agents don't all fire
+	// Uniform in [0.5, 1.5) × TaskGap keeps the mean at TaskGap.
+	gap := func() time.Duration { return time.Duration((0.5 + rng.Float64()) * float64(a.cfg.TaskGap)) }
+
+	// Start at a random point in the first gap, so agents don't all fire
 	// their first call at the same instant.
-	sleep(ctx, time.Duration(rng.Float64()*float64(a.cfg.TaskPause)))
-	for ctx.Err() == nil {
+	wanted := time.Now().Add(time.Duration(rng.Float64() * float64(a.cfg.TaskGap)))
+	for {
+		if !sleep(ctx, time.Until(wanted)) {
+			return
+		}
 		method, path := http.MethodGet, "/repos/o/r/contents/file.go"
 		if rng.Float64() < a.cfg.WriteFrac {
 			method, path = http.MethodPost, "/repos/o/r/issues/1/comments"
 		}
-		wanted := time.Now()
-		if a.do(ctx, rng, method, path) {
-			a.rec.Critical(wanted, time.Now())
-		} else {
-			a.rec.Critical(wanted, time.Time{})
-			return
+		if !a.do(ctx, rng, method, path) {
+			break
 		}
-		// Uniform in [0.5, 1.5) × TaskPause keeps the mean at TaskPause.
-		sleep(ctx, time.Duration((0.5+rng.Float64())*float64(a.cfg.TaskPause)))
+		a.rec.Critical(wanted, time.Now())
+		wanted = wanted.Add(gap())
+	}
+
+	// The run ended. Record the call in flight and every call the schedule
+	// wanted before the end as unfinished.
+	end, ok := ctx.Deadline()
+	if !ok {
+		end = time.Now()
+	}
+	for ; wanted.Before(end); wanted = wanted.Add(gap()) {
+		a.rec.Critical(wanted, time.Time{})
 	}
 }
 

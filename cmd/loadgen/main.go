@@ -58,22 +58,23 @@ func main() {
 		log.Fatalf("pollers (%d) can't exceed agents (%d)", *pollers, *nAgents)
 	}
 
-	// Turn demand into pauses. Each agent's calls are sequential, so one
-	// call cycle is latency + pause.
+	// Turn demand into timing. Task calls run on a schedule, one every
+	// taskGap per agent. Polls are sequential, so one poll cycle is
+	// latency + pollEvery.
 	rate := *demand * float64(*budget) / window.Seconds() // requests per second
 	taskRate := rate * (1 - *bgShare)
-	taskPause := time.Duration(float64(*nAgents)/taskRate*float64(time.Second)) - *latency
+	taskGap := time.Duration(float64(*nAgents) / taskRate * float64(time.Second))
 	pollEvery := time.Duration(0)
 	if *pollers > 0 {
 		pollEvery = time.Duration(float64(*pollers)/(rate**bgShare)*float64(time.Second)) - *latency
 	}
-	if taskPause < 0 || pollEvery < 0 {
+	if taskGap < *latency || pollEvery < 0 {
 		log.Fatalf("demand %.2g needs more agents or pollers: at %v latency each can't send that fast", *demand, *latency)
 	}
 
 	cfg := agents.Config{
 		BaseURL: *target, Token: *token, Strategy: strategy,
-		Agents: *nAgents, Pollers: *pollers, TaskPause: taskPause, PollEvery: pollEvery, WriteFrac: *writeFrac,
+		Agents: *nAgents, Pollers: *pollers, TaskGap: taskGap, PollEvery: pollEvery, WriteFrac: *writeFrac,
 		BaseBackoff: time.Second, MaxBackoff: 32 * time.Second, Seed: *seed,
 	}
 

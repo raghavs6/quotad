@@ -117,7 +117,7 @@ func TestRunStopsAndRecordsUnfinished(t *testing.T) {
 	defer cancel()
 	Run(ctx, Config{
 		BaseURL: srv.URL, Token: "t", Strategy: HeaderAware,
-		Agents: 3, Pollers: 1, TaskPause: 10 * time.Millisecond, PollEvery: 10 * time.Millisecond,
+		Agents: 3, Pollers: 1, TaskGap: 100 * time.Millisecond, PollEvery: 10 * time.Millisecond,
 		BaseBackoff: time.Second, MaxBackoff: time.Second, Seed: 1,
 	}, srv.Client(), rec)
 
@@ -125,8 +125,15 @@ func TestRunStopsAndRecordsUnfinished(t *testing.T) {
 		t.Fatalf("Run took %v after a 500ms deadline", el)
 	}
 	s := rec.Summarize(time.Now())
-	// Each agent finishes one 300ms call, then is cut off mid-call.
-	if s.CriticalDone != 3 || s.CriticalUnfinished != 3 {
-		t.Fatalf("done %d unfinished %d, want 3 and 3", s.CriticalDone, s.CriticalUnfinished)
+	// Each agent wants a call every ~100ms but each takes 300ms, so it
+	// finishes one, is cut off mid-call on the second, and the schedule
+	// wanted about 3 more before the 500ms deadline.
+	if s.CriticalDone != 3 || s.CriticalUnfinished < 9 || s.CriticalUnfinished > 18 {
+		t.Fatalf("done %d unfinished %d, want 3 done and 9-18 unfinished", s.CriticalDone, s.CriticalUnfinished)
+	}
+	// The second call was wanted ~100ms in but never finished, so p95 sees
+	// a wait close to the 400ms between then and the end.
+	if s.CriticalP95 < 0.25 {
+		t.Fatalf("p95 = %.2fs, want the unfinished calls' waits counted", s.CriticalP95)
 	}
 }
