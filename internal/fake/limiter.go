@@ -64,13 +64,12 @@ type Decision struct {
 
 // Stats counts what happened to one token.
 type Stats struct {
-	Requests     int   `json:"requests"`
-	OK           int   `json:"ok"`
-	Primary403   int   `json:"primary_403"`
-	Secondary429 int   `json:"secondary_429"`
-	Violations   int   `json:"violations"`
-	Windows      int   `json:"windows"`      // primary windows started, for utilization
-	WindowReset  int64 `json:"window_reset"` // when the latest window resets, epoch seconds
+	Requests     int `json:"requests"`
+	OK           int `json:"ok"`
+	Primary403   int `json:"primary_403"`
+	Secondary429 int `json:"secondary_429"`
+	Violations   int `json:"violations"`
+	Windows      int `json:"windows"` // primary windows started, for utilization
 }
 
 type tokenState struct {
@@ -126,7 +125,6 @@ func (l *Limiter) Begin(token string, write bool) (d Decision, release func()) {
 		st.resetAt = t.Truncate(time.Second).Add(l.cfg.Window)
 		st.used = 0
 		st.stats.Windows++
-		st.stats.WindowReset = st.resetAt.Unix()
 	}
 	if !t.Before(st.pointsAt) {
 		st.pointsAt = t.Add(l.cfg.PointsWindow)

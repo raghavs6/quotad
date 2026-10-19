@@ -28,7 +28,7 @@ type Result struct {
 	Demand      float64         `json:"demand"`
 	Seed        uint64          `json:"seed"`
 	Server      fake.Stats      `json:"server"`
-	Utilization float64         `json:"utilization"` // successful requests ÷ budget available during the run
+	Utilization float64         `json:"utilization"` // successful requests ÷ budget of the windows started
 	Agents      metrics.Summary `json:"agents"`
 }
 
@@ -96,7 +96,7 @@ func main() {
 		log.Fatal(err)
 	}
 	res := Result{Strategy: strategy.String(), Demand: *demand, Seed: *seed, Server: server, Agents: rec.Summarize(end)}
-	res.Utilization = utilization(server, *budget, *window, end)
+	res.Utilization = utilization(server, *budget)
 
 	if *asJSON {
 		json.NewEncoder(os.Stdout).Encode(res)
@@ -115,17 +115,15 @@ func main() {
 	fmt.Printf("  rejections per sec  %v\n", a.RejectionsPerS)
 }
 
-// utilization is successful requests ÷ the budget available during the run.
-// Windows start on the first request after a reset, so they can drift and
-// the last one can be cut off by the end of the run; that last window's
-// budget counts only for the part of it inside the run.
-func utilization(s fake.Stats, budget int, window time.Duration, end time.Time) float64 {
+// utilization is successful requests ÷ the budget of every window the run
+// started. Windows start on the first request after a reset, so they drift
+// with traffic, and a window opened near the end counts in full. That keeps
+// utilization at or below 100% but makes short runs look a little worse.
+func utilization(s fake.Stats, budget int) float64 {
 	if s.Windows == 0 {
 		return 0
 	}
-	lastStart := time.Unix(s.WindowReset, 0).Add(-window)
-	inside := min(1, max(0, end.Sub(lastStart).Seconds()/window.Seconds()))
-	return float64(s.OK) / (float64(budget) * (float64(s.Windows-1) + inside))
+	return float64(s.OK) / float64(budget*s.Windows)
 }
 
 func fetchStats(url, token string) (fake.Stats, error) {
