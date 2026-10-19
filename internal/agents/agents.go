@@ -105,6 +105,9 @@ type agent struct {
 // taskStream sends critical calls one after another: mostly reads, some
 // writes, with a short pause between them.
 func (a *agent) taskStream(ctx context.Context, rng *rand.Rand) {
+	// Start at a random point in the first pause, so agents don't all fire
+	// their first call at the same instant.
+	sleep(ctx, time.Duration(rng.Float64()*float64(a.cfg.TaskPause)))
 	for ctx.Err() == nil {
 		method, path := http.MethodGet, "/repos/o/r/contents/file.go"
 		if rng.Float64() < a.cfg.WriteFrac {
@@ -124,6 +127,7 @@ func (a *agent) taskStream(ctx context.Context, rng *rand.Rand) {
 
 // poll asks "is CI done?" every PollEvery. These are background calls.
 func (a *agent) poll(ctx context.Context, rng *rand.Rand) {
+	sleep(ctx, time.Duration(rng.Float64()*float64(a.cfg.PollEvery)))
 	for ctx.Err() == nil {
 		if !a.do(ctx, rng, http.MethodGet, "/repos/o/r/actions/runs") {
 			return

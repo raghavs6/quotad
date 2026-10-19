@@ -46,7 +46,7 @@ func TestServerHeadersAndStats(t *testing.T) {
 	if err := json.NewDecoder(statsResp.Body).Decode(&stats); err != nil {
 		t.Fatal(err)
 	}
-	want := Stats{Requests: 3, OK: 2, Primary403: 1, Violations: 1, Windows: 1}
+	want := Stats{Requests: 3, OK: 2, Primary403: 1, Violations: 1, Windows: 1, WindowReset: 1792411260}
 	if got := stats["token abc"]; got != want {
 		t.Fatalf("stats = %+v, want %+v", got, want)
 	}
