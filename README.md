@@ -2,7 +2,7 @@
 
 A rate-limit governor for AI agent fleets. Agents send their API traffic through a small local proxy that learns the provider's real remaining quota from response headers, shares one budget across agents, and spends it on critical calls first.
 
-**Status:** step 1 of chunk 1. There's no proxy yet; this is the test bench it will be judged on: a fake GitHub API and simulated agents running two baseline retry strategies. See [docs/governor-step1.md](docs/governor-step1.md).
+**Status:** step 1 of chunk 1. There's no proxy yet; this is the test bench it will be judged on: a fake GitHub API and simulated agents running two baseline retry strategies. See [docs/governor-step1.md](docs/governor-step1.md) for the design and [docs/step1-baselines.md](docs/step1-baselines.md) for the baseline numbers.
 
 ## Run the bench
 
