@@ -149,5 +149,5 @@ After substantial implementation, switch from building to understanding:
 
 - `PROJECT.md` — the brief: problem, architecture, decisions, build plan (chunks), success targets, open questions. Seed it from `governor-design.md` and `governor-handoff.md`.
 - `docs/` — per-step design write-ups (e.g. `governor-step1.md`), written for sign-off before the code.
-- `UPDATES.md` — a log, newest first. After each working day or major change, add a 1-2 sentence entry on what we did, with the numbers if there are any.
+- `UPDATES.md` — a log, newest first, gitignored (not committed). Every few steps, add an entry with the design decisions we made and any numbers we ran.
 - Longer explanations go in a file, not in chat.

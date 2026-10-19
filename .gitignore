@@ -1,2 +1,6 @@
+# Local working log, not tracked
+UPDATES.md
+
+# Build output and raw bench runs
 bin/
 results/
