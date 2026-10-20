@@ -3,6 +3,9 @@
 // HTTP, and repeats each setting -runs times. It prints a Markdown table of
 // averages and ranges, and saves every run as a JSON line.
 //
+// With -proxy, quotad sits between loadgen and fakegithub. Violations are
+// still counted by fakegithub, so they mean the same thing either way.
+//
 // Build the programs first: go build -o bin/ ./cmd/...
 package main
 
@@ -59,6 +62,8 @@ func main() {
 	parallel := flag.Int("parallel", 1, "runs at once, each against its own server")
 	port := flag.Int("port", 18100, "first port; each parallel slot uses its own")
 	out := flag.String("out", "results/bench.jsonl", "where to save every run")
+	viaProxy := flag.Bool("proxy", false, "put quotad between the agents and the fake server")
+	maxHold := flag.Duration("max-hold", 0, "quotad's max hold (0 = window/120, GitHub's 30s per hour scaled)")
 	flag.Parse()
 
 	var settings []setting
@@ -70,6 +75,11 @@ func main() {
 		for _, s := range strings.Split(*strategies, ",") {
 			settings = append(settings, setting{strings.TrimSpace(s), demand})
 		}
+	}
+
+	hold := *maxHold
+	if hold == 0 {
+		hold = *window / 120
 	}
 
 	type job struct {
@@ -84,6 +94,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			addr := fmt.Sprintf("127.0.0.1:%d", *port+slot)
+			proxyAddr := fmt.Sprintf("127.0.0.1:%d", *port+*parallel+slot)
 			for j := range jobs {
 				server := exec.Command(filepath.Join(*bin, "fakegithub"),
 					"-addr", addr, "-budget", strconv.Itoa(*budget), "-window", window.String(),
@@ -93,16 +104,34 @@ func main() {
 					log.Fatal(err)
 				}
 				waitForPort(addr)
+				target := "http://" + addr
+				var proxy *exec.Cmd
+				if *viaProxy {
+					// Both programs share this machine's clock, so no reset guard.
+					proxy = exec.Command(filepath.Join(*bin, "quotad"),
+						"-listen", proxyAddr, "-upstream", target,
+						"-max-hold", hold.String(), "-reset-guard", "0")
+					proxy.Stderr = os.Stderr
+					if err := proxy.Start(); err != nil {
+						log.Fatal(err)
+					}
+					waitForPort(proxyAddr)
+					target = "http://" + proxyAddr
+				}
 
 				var stdout bytes.Buffer
 				lg := exec.Command(filepath.Join(*bin, "loadgen"), "-json",
-					"-target", "http://"+addr, "-strategy", j.strategy,
+					"-target", target, "-stats", "http://"+addr+"/__stats", "-strategy", j.strategy,
 					"-demand", strconv.FormatFloat(j.demand, 'g', -1, 64),
 					"-budget", strconv.Itoa(*budget), "-window", window.String(), "-latency", latency.String(),
 					"-windows", strconv.Itoa(*windows), "-agents", strconv.Itoa(*nAgents),
 					"-pollers", strconv.Itoa(*pollers), "-seed", strconv.FormatUint(j.seed, 10))
 				lg.Stdout, lg.Stderr = &stdout, os.Stderr
 				err := lg.Run()
+				if proxy != nil {
+					proxy.Process.Kill()
+					proxy.Wait()
+				}
 				server.Process.Kill()
 				server.Wait()
 				if err != nil {
@@ -151,6 +180,9 @@ func main() {
 			done, total, r.Strategy, r.Demand, r.Seed, r.Server.Violations, r.Agents.CriticalP95)
 	}
 
+	if *viaProxy {
+		fmt.Printf("Through quotad (max hold %v, reset guard 0). ", hold)
+	}
 	fmt.Printf("%d agents (%d polling), budget %d per %v, %d in flight, %v latency, %d windows per run, %d runs per row. Cells are mean [min–max].\n\n",
 		*nAgents, *pollers, *budget, *window, *concurrency, *latency, *windows, *runs)
 	fmt.Println("| demand | strategy | violations | 403s | 429s | peak rejections/s | rejections ≤2s after reset | critical p50 (s) | critical p95 (s) | unfinished critical | utilization |")
