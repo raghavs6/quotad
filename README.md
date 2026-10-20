@@ -40,7 +40,7 @@ go build -o bin/ ./cmd/...
 bin/fakegithub &                          # 500 requests per 60s "hour"
 bin/loadgen -strategy header-aware -demand 2
 
-# The full baseline: 2 strategies × 4 demand levels × 5 runs, as a Markdown table.
+# The full baseline: 2 strategies × 5 demand levels × 5 runs, as a Markdown table.
 bin/bench -parallel 8 > results/baseline.md
 ```
 

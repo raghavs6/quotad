@@ -48,7 +48,7 @@ func main() {
 	bin := flag.String("bin", "bin", "directory holding the fakegithub and loadgen binaries")
 	runs := flag.Int("runs", 5, "runs per setting")
 	strategies := flag.String("strategies", "backoff,header-aware", "comma-separated strategies")
-	demands := flag.String("demands", "0.5,1,2,5", "comma-separated demand multiples")
+	demands := flag.String("demands", "0.5,1,1.2,2,5", "comma-separated demand multiples")
 	budget := flag.Int("budget", 500, "budget per window")
 	window := flag.Duration("window", 60*time.Second, "window (GitHub: 1h)")
 	windows := flag.Int("windows", 3, "run length, in windows")
