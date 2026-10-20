@@ -6,7 +6,7 @@ Agents point their API base URL at a small proxy on their machine. quotad reads 
 
 ## Status
 
-Early. Nothing usable yet. The test bench (a fake GitHub server and a load generator) is built and has measured the problem; the proxy comes next. See [PROJECT.md](PROJECT.md) for the plan, [docs/governor-step1.md](docs/governor-step1.md) for the bench design, and [docs/step1-baselines.md](docs/step1-baselines.md) for the baseline numbers.
+Early, not ready for production. The test bench is built, and the first proxy step works: quotad holds requests once a token's main budget is gone, so no request reaches the upstream while that limit is in force. Secondary limits (concurrency, `retry-after`) and priorities come next. See [PROJECT.md](PROJECT.md) for the plan, [docs/step1-baselines.md](docs/step1-baselines.md) for the baseline numbers, and [docs/step2-results.md](docs/step2-results.md) for the proxy's first results.
 
 ## How it will work
 
@@ -42,15 +42,21 @@ bin/loadgen -strategy header-aware -demand 2
 
 # The full baseline: 2 strategies × 5 demand levels × 5 runs, as a Markdown table.
 bin/bench -parallel 8 > results/baseline.md
+
+# The same, with quotad between the agents and the fake server.
+bin/bench -proxy -parallel 8 > results/quotad.md
 ```
 
 `curl -i -H 'Authorization: token x' localhost:8081/repos/o/r` shows the `x-ratelimit-*` headers; `curl localhost:8081/__stats` shows violation counts.
 
 | Path | What |
 |---|---|
+| `cmd/quotad` | The proxy: `-upstream`, `-listen`, `-max-hold`, `-reset-guard` |
 | `cmd/fakegithub` | Fake GitHub REST API with GitHub's primary and secondary limits, scaled by flags |
 | `cmd/loadgen` | Simulated agents sharing one token |
 | `cmd/bench` | Runs every setting 5 times against fresh servers and reports ranges |
+| `internal/budget` | One token's budget: reserve, then correct from headers; hold and release |
+| `internal/proxy` | quotad's HTTP layer around `httputil.ReverseProxy` |
 | `internal/fake` | The rate-limit rules |
 | `internal/agents` | Agent behavior and the two baseline strategies |
 | `internal/metrics` | Percentiles, rejections over time, ranges |
