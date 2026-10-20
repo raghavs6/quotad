@@ -30,6 +30,7 @@ Agents need no code changes: they point their API base URL at the local proxy.
 | Topic | Decision |
 |---|---|
 | Style | Open-source product, not research. No formal verification or TLA+ |
+| License | Apache-2.0 (confirmed 2026-10-20) |
 | Language | Go, one module (`cmd/` programs, `internal/` packages) |
 | Where it runs | A proxy on each machine. Solo mode (in-memory, no Redis) by default |
 | Sharing a budget | **Reserve, then correct:** reserve the estimated cost before sending, correct from headers. GitHub: within a window `used` only goes up (take the max). LLMs (refilling buckets): headers may only lower our estimate |
@@ -59,6 +60,5 @@ Agents need no code changes: they point their API base URL at the local proxy.
 
 ## Open questions
 
-1. License: Apache-2.0 recommended, not yet confirmed.
-2. Why Go is not written down. Likely reasons: goroutines handle many held requests cheaply, the standard library has a production HTTP server and reverse proxy, and it builds to a single binary.
-3. LLM details (not blocking until step 4): which provider first (suggested Anthropic), how much to reserve per call, and whether to add OpenAI's `stream_options.include_usage` to streamed requests.
+1. Why Go is not written down. Likely reasons: goroutines handle many held requests cheaply, the standard library has a production HTTP server and reverse proxy, and it builds to a single binary.
+2. LLM details (not blocking until step 4): which provider first (suggested Anthropic), how much to reserve per call, and whether to add OpenAI's `stream_options.include_usage` to streamed requests.

@@ -54,3 +54,7 @@ bin/bench -parallel 8 > results/baseline.md
 | `internal/fake` | The rate-limit rules |
 | `internal/agents` | Agent behavior and the two baseline strategies |
 | `internal/metrics` | Percentiles, rejections over time, ranges |
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
