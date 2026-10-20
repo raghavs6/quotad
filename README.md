@@ -6,7 +6,7 @@ Agents point their API base URL at a small proxy on their machine. quotad reads 
 
 ## Status
 
-Early. Nothing usable yet. We're building the test bench (a fake GitHub server and a load generator) to measure the problem before building the proxy. See [PROJECT.md](PROJECT.md) for the plan.
+Early. Nothing usable yet. The test bench (a fake GitHub server and a load generator) is built and has measured the problem; the proxy comes next. See [PROJECT.md](PROJECT.md) for the plan, [docs/governor-step1.md](docs/governor-step1.md) for the bench design, and [docs/step1-baselines.md](docs/step1-baselines.md) for the baseline numbers.
 
 ## How it will work
 
@@ -28,5 +28,29 @@ First upstream is GitHub REST. OpenAI and Anthropic come later.
 Requires Go.
 
 ```sh
-go test ./...
+go test -race ./...
 ```
+
+### Run the bench
+
+```sh
+go build -o bin/ ./cmd/...
+
+# One run, by hand:
+bin/fakegithub &                          # 500 requests per 60s "hour"
+bin/loadgen -strategy header-aware -demand 2
+
+# The full baseline: 2 strategies × 4 demand levels × 5 runs, as a Markdown table.
+bin/bench -parallel 8 > results/baseline.md
+```
+
+`curl -i -H 'Authorization: token x' localhost:8081/repos/o/r` shows the `x-ratelimit-*` headers; `curl localhost:8081/__stats` shows violation counts.
+
+| Path | What |
+|---|---|
+| `cmd/fakegithub` | Fake GitHub REST API with GitHub's primary and secondary limits, scaled by flags |
+| `cmd/loadgen` | Simulated agents sharing one token |
+| `cmd/bench` | Runs every setting 5 times against fresh servers and reports ranges |
+| `internal/fake` | The rate-limit rules |
+| `internal/agents` | Agent behavior and the two baseline strategies |
+| `internal/metrics` | Percentiles, rejections over time, ranges |
