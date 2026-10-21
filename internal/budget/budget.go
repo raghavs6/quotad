@@ -4,7 +4,9 @@
 // Four checks must all pass before a request is sent:
 //   - Primary budget, learned from response headers (x-ratelimit-*).
 //   - In-flight cap: requests sent but not yet answered.
-//   - Points per window, counted over a sliding window (read 1, write 5).
+//   - Points per window (read 1, write 5). A request's points count from
+//     when it is sent until a full window after its answer, so any stretch
+//     of one window at the upstream stays under the cap.
 //   - No pause: after a secondary-limit 429, every request on the token
 //     waits until the upstream's retry-after has passed.
 //
@@ -22,6 +24,7 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -84,18 +87,29 @@ type Budget struct {
 	waiting   []*waiter // held requests, oldest first
 	timerAt   time.Time // when the pending wake-up timer fires, to avoid duplicates
 
-	spent  []spend   // points of requests sent within the last PointsWindow, oldest first
+	spent  []*spend  // points of requests in flight or answered within the last PointsWindow
 	paused time.Time // no request goes out before this (after a secondary-limit answer)
 	streak int       // secondary-limit answers in a row without retry-after
 }
 
+// spend is one request's points. They count from when it is sent until
+// PointsWindow after its answer. The upstream counted it at some moment in
+// between, and we can't know when, so the answer time is the safe end.
 type spend struct {
-	at   time.Time
-	cost int
+	cost     int
+	answered time.Time // zero while in flight
+}
+
+// close marks the request answered (or abandoned) now.
+func (s *spend) close(now time.Time) {
+	if s.answered.IsZero() {
+		s.answered = now
+	}
 }
 
 type waiter struct {
 	cost     int
+	sp       *spend     // set when admitted
 	deadline time.Time  // arrival + MaxHold
 	done     chan error // nil error = admitted
 }
@@ -140,9 +154,11 @@ func (b *Budget) Acquire(ctx context.Context, write bool) (*Ticket, error) {
 		cost = WriteCost
 	}
 	b.mu.Lock()
-	if len(b.waiting) == 0 && b.admitLocked(cost) {
-		b.mu.Unlock()
-		return &Ticket{b: b}, nil
+	if len(b.waiting) == 0 {
+		if sp := b.admitLocked(cost); sp != nil {
+			b.mu.Unlock()
+			return &Ticket{b: b, sp: sp}, nil
+		}
 	}
 	now := b.now()
 	if err := b.tooLongLocked(now, now.Add(b.cfg.MaxHold)); err != nil {
@@ -160,7 +176,7 @@ func (b *Budget) Acquire(ctx context.Context, write bool) (*Ticket, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Ticket{b: b}, nil
+		return &Ticket{b: b, sp: w.sp}, nil
 	case <-ctx.Done():
 		b.mu.Lock()
 		defer b.mu.Unlock()
@@ -174,7 +190,7 @@ func (b *Budget) Acquire(ctx context.Context, write bool) (*Ticket, error) {
 		// give the unit back so nothing is reserved for a request never sent.
 		if err := <-w.done; err == nil {
 			b.reserved--
-			// Its points stay counted: a little conservative, never unsafe.
+			w.sp.close(b.now()) // never sent; its points simply expire
 			if !b.known {
 				b.probing = false
 			}
@@ -185,26 +201,27 @@ func (b *Budget) Acquire(ctx context.Context, write bool) (*Ticket, error) {
 }
 
 // admitLocked reserves one unit, one in-flight slot and cost points if all
-// four checks pass now.
-func (b *Budget) admitLocked(cost int) bool {
+// four checks pass now. It returns the points record, or nil.
+func (b *Budget) admitLocked(cost int) *spend {
 	now := b.now()
 	b.rollLocked()
 	b.pruneLocked(now)
 	if now.Before(b.paused) || b.reserved >= b.cfg.MaxInFlight || b.pointsLocked()+cost > b.cfg.Points {
-		return false
+		return nil
 	}
 	switch {
 	case !b.known && !b.probing:
 		// Learn first: one request goes out; the rest wait for its headers.
 		b.probing = true
 	case !b.known:
-		return false
+		return nil
 	case b.primaryOutLocked():
-		return false
+		return nil
 	}
 	b.reserved++
-	b.spent = append(b.spent, spend{now, cost})
-	return true
+	sp := &spend{cost: cost}
+	b.spent = append(b.spent, sp)
+	return sp
 }
 
 // primaryOutLocked reports whether the primary budget is used up until the
@@ -213,13 +230,11 @@ func (b *Budget) primaryOutLocked() bool {
 	return b.known && b.remaining-b.reserved <= 0
 }
 
-// pruneLocked forgets points spent more than PointsWindow ago.
+// pruneLocked forgets points of requests answered more than PointsWindow ago.
 func (b *Budget) pruneLocked(now time.Time) {
-	i := 0
-	for i < len(b.spent) && !b.spent[i].at.Add(b.cfg.PointsWindow).After(now) {
-		i++
-	}
-	b.spent = b.spent[i:]
+	b.spent = slices.DeleteFunc(b.spent, func(s *spend) bool {
+		return !s.answered.IsZero() && !s.answered.Add(b.cfg.PointsWindow).After(now)
+	})
 }
 
 func (b *Budget) pointsLocked() int {
@@ -280,8 +295,10 @@ func (b *Budget) scheduleLocked(now time.Time) {
 		consider(b.reset.Add(b.cfg.ResetGuard))
 	}
 	consider(b.paused)
-	if len(b.spent) > 0 {
-		consider(b.spent[0].at.Add(b.cfg.PointsWindow))
+	for _, s := range b.spent {
+		if !s.answered.IsZero() {
+			consider(s.answered.Add(b.cfg.PointsWindow))
+		}
 	}
 	if at.IsZero() || (!b.timerAt.IsZero() && !at.Before(b.timerAt)) {
 		return // nothing to wait for, or a timer at or before it is already set
@@ -309,9 +326,11 @@ func (b *Budget) drainLocked() {
 	admitting := true
 	kept := b.waiting[:0]
 	for _, w := range b.waiting {
-		if admitting && b.admitLocked(w.cost) {
-			w.done <- nil
-			continue
+		if admitting {
+			if w.sp = b.admitLocked(w.cost); w.sp != nil {
+				w.done <- nil
+				continue
+			}
 		}
 		admitting = false // keep arrival order: nobody jumps the line
 		if err := b.tooLongLocked(now, w.deadline); err != nil {
@@ -330,6 +349,7 @@ func (b *Budget) drainLocked() {
 // Ticket is one admitted request's reservation.
 type Ticket struct {
 	b    *Budget
+	sp   *spend
 	once sync.Once
 }
 
@@ -350,6 +370,7 @@ func (t *Ticket) Done(status int, h http.Header) {
 		b := t.b
 		b.mu.Lock()
 		defer b.mu.Unlock()
+		t.sp.close(b.now())
 		b.reserved--
 		b.probing = false
 		b.known = true
@@ -379,6 +400,7 @@ func (t *Ticket) Failed() {
 		b := t.b
 		b.mu.Lock()
 		defer b.mu.Unlock()
+		t.sp.close(b.now())
 		b.reserved--
 		if b.known {
 			b.remaining--

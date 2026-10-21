@@ -356,21 +356,27 @@ func TestPointsCap(t *testing.T) {
 	}
 }
 
-func TestPointsWindowSlides(t *testing.T) {
-	b, c := learned(t, Config{MaxHold: 2 * time.Minute, Points: 6, PointsWindow: time.Minute})
+func TestPointsCountUntilAWindowAfterTheAnswer(t *testing.T) {
+	b, c := learned(t, Config{MaxHold: 5 * time.Minute, Points: 6, PointsWindow: time.Minute})
 	c.advance(40 * time.Second)
-	if _, err := b.Acquire(context.Background(), true); err != nil { // 1 + 5 = 6 points
+	w, err := b.Acquire(context.Background(), true) // 1 (probe) + 5 = 6 points
+	if err != nil {
 		t.Fatal(err)
 	}
-	// At 60s the probe's point leaves the window, but the write's 5 stay
-	// until 100s. A second write must wait for those.
 	held := acquireWrite(context.Background(), b, true)
 	waitingCount(t, b, 1)
-	c.advance(20 * time.Second)
+
+	// While the write is in flight, its points never expire.
+	c.advance(2 * time.Minute)
 	mustBeHeld(t, held)
-	c.advance(40 * time.Second)
+
+	// Once answered, they count for one more window, then the next write fits.
+	w.Done(200, headers(5000, 4998, t0.Add(time.Hour)))
+	c.advance(59 * time.Second)
+	mustBeHeld(t, held)
+	c.advance(time.Second)
 	if r := mustGet(t, held); r.err != nil {
-		t.Fatalf("write after the first write left the window: %v", r.err)
+		t.Fatalf("write a window after the first write's answer: %v", r.err)
 	}
 }
 
