@@ -61,6 +61,10 @@ type Config struct {
 	PollEvery time.Duration // pause between a poller's calls
 	WriteFrac float64       // share of task calls that are writes
 
+	// Paths to call; empty means the fake server's paths. ReadPath
+	// may carry a query string.
+	ReadPath, WritePath, PollPath string
+
 	BaseBackoff time.Duration // first backoff step
 	MaxBackoff  time.Duration // backoff cap
 	Seed        uint64
@@ -122,9 +126,9 @@ func (a *agent) taskStream(ctx context.Context, rng *rand.Rand) {
 		if !sleep(ctx, time.Until(wanted)) {
 			return
 		}
-		method, path := http.MethodGet, "/repos/o/r/contents/file.go"
+		method, path := http.MethodGet, or(a.cfg.ReadPath, "/repos/o/r/contents/file.go")
 		if rng.Float64() < a.cfg.WriteFrac {
-			method, path = http.MethodPost, "/repos/o/r/issues/1/comments"
+			method, path = http.MethodPost, or(a.cfg.WritePath, "/repos/o/r/issues/1/comments")
 		}
 		if !a.do(ctx, rng, method, path) {
 			break
@@ -148,7 +152,7 @@ func (a *agent) taskStream(ctx context.Context, rng *rand.Rand) {
 func (a *agent) poll(ctx context.Context, rng *rand.Rand) {
 	sleep(ctx, time.Duration(rng.Float64()*float64(a.cfg.PollEvery)))
 	for ctx.Err() == nil {
-		if !a.do(ctx, rng, http.MethodGet, "/repos/o/r/actions/runs") {
+		if !a.do(ctx, rng, http.MethodGet, or(a.cfg.PollPath, "/repos/o/r/actions/runs")) {
 			return
 		}
 		sleep(ctx, a.cfg.PollEvery)
@@ -245,6 +249,13 @@ func (a *agent) blockedUntil() time.Time {
 		until = a.reset
 	}
 	return until
+}
+
+func or(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
 
 // sleep waits for d or until ctx is done. It reports whether ctx is still live.
