@@ -1,6 +1,6 @@
 // Package proxy is quotad's HTTP layer: it holds each request until its
-// token's budget allows it, forwards it to the upstream, and feeds the
-// response headers back into the budget.
+// token's limits allow it, forwards it to the upstream, and feeds the
+// response back into the budget.
 package proxy
 
 import (
@@ -42,7 +42,7 @@ func New(upstream *url.URL, cfg budget.Config) *Proxy {
 			IdleConnTimeout:     90 * time.Second,
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			ticket(resp.Request.Context()).Done(resp.Header)
+			ticket(resp.Request.Context()).Done(resp.StatusCode, resp.Header)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -72,7 +72,9 @@ func (p *Proxy) budgetFor(token string) *budget.Budget {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	t, err := p.budgetFor(r.Header.Get("Authorization")).Acquire(r.Context())
+	// Like GitHub's points rule: GET, HEAD and OPTIONS are reads, the rest writes.
+	write := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+	t, err := p.budgetFor(r.Header.Get("Authorization")).Acquire(r.Context(), write)
 	var tooLong *budget.TooLongError
 	switch {
 	case errors.As(err, &tooLong):
