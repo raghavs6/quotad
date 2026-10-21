@@ -6,7 +6,7 @@ Agents point their API base URL at a small proxy on their machine. quotad reads 
 
 ## Status
 
-Early, not ready for production. The test bench is built, and the first proxy step works: quotad holds requests once a token's main budget is gone, so no request reaches the upstream while that limit is in force. Secondary limits (concurrency, `retry-after`) and priorities come next. See [PROJECT.md](PROJECT.md) for the plan, [docs/step1-baselines.md](docs/step1-baselines.md) for the baseline numbers, and [docs/step2-results.md](docs/step2-results.md) for the proxy's first results.
+Early, not ready for production. The test bench is built. quotad keeps each key under GitHub's main budget and its secondary limits (requests in flight, points per minute), and it pauses every agent on a key after a 429. In the bench, no request reaches the upstream while it is limited. Priorities come next. See [PROJECT.md](PROJECT.md) for the plan, [docs/step1-baselines.md](docs/step1-baselines.md) for the baseline numbers, and [docs/step3-results.md](docs/step3-results.md) for the latest results.
 
 ## How it will work
 
@@ -51,11 +51,11 @@ bin/bench -proxy -parallel 8 > results/quotad.md
 
 | Path | What |
 |---|---|
-| `cmd/quotad` | The proxy: `-upstream`, `-listen`, `-max-hold`, `-reset-guard` |
+| `cmd/quotad` | The proxy: `-upstream`, `-listen`, `-max-hold`, `-reset-guard`, and the secondary limits `-max-in-flight`, `-points`, `-points-window`, `-min-pause` (defaults are GitHub's numbers) |
 | `cmd/fakegithub` | Fake GitHub REST API with GitHub's primary and secondary limits, scaled by flags |
 | `cmd/loadgen` | Simulated agents sharing one token |
 | `cmd/bench` | Runs every setting 5 times against fresh servers and reports ranges |
-| `internal/budget` | One token's budget: reserve, then correct from headers; hold and release |
+| `internal/budget` | One token's limits: primary budget (reserve, then correct from headers), in-flight cap, points, shared pause; hold and release |
 | `internal/proxy` | quotad's HTTP layer around `httputil.ReverseProxy` |
 | `internal/fake` | The rate-limit rules |
 | `internal/agents` | Agent behavior and the two baseline strategies |
