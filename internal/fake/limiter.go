@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 )
@@ -69,7 +70,11 @@ type Stats struct {
 	Primary403   int `json:"primary_403"`
 	Secondary429 int `json:"secondary_429"`
 	Violations   int `json:"violations"`
-	Windows      int `json:"windows"` // primary windows started, for utilization
+	Windows      int `json:"windows"` // primary windows started
+	// Per window, in order: when it reset (epoch seconds) and how many
+	// requests succeeded in it. Used to compute utilization over full windows.
+	WindowResets []int64 `json:"window_resets"`
+	WindowOK     []int   `json:"window_ok"`
 }
 
 type tokenState struct {
@@ -125,6 +130,8 @@ func (l *Limiter) Begin(token string, write bool) (d Decision, release func()) {
 		st.resetAt = t.Truncate(time.Second).Add(l.cfg.Window)
 		st.used = 0
 		st.stats.Windows++
+		st.stats.WindowResets = append(st.stats.WindowResets, st.resetAt.Unix())
+		st.stats.WindowOK = append(st.stats.WindowOK, 0)
 	}
 	if !t.Before(st.pointsAt) {
 		st.pointsAt = t.Add(l.cfg.PointsWindow)
@@ -157,6 +164,7 @@ func (l *Limiter) Begin(token string, write bool) (d Decision, release func()) {
 		st.points += cost
 		st.inflight++
 		st.stats.OK++
+		st.stats.WindowOK[len(st.stats.WindowOK)-1]++
 		release = sync.OnceFunc(func() {
 			l.mu.Lock()
 			st.inflight--
@@ -184,7 +192,10 @@ func (l *Limiter) Stats() map[string]Stats {
 	defer l.mu.Unlock()
 	out := make(map[string]Stats, len(l.tokens))
 	for tok, st := range l.tokens {
-		out[tok] = st.stats
+		s := st.stats
+		s.WindowResets = slices.Clone(s.WindowResets)
+		s.WindowOK = slices.Clone(s.WindowOK)
+		out[tok] = s
 	}
 	return out
 }

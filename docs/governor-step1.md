@@ -101,4 +101,4 @@ Five questions came up in review. Here is what each one changed.
 
 Two other choices made while building:
 - **Concurrency limit defaults to 10**, not GitHub's 100. With 10 agents and 5 pollers, at most 15 calls are in flight, so a limit of 100 could never be reached. It's a flag.
-- **Utilization divides by the full budget of every window started.** Windows start on the first request after a reset, so they drift with traffic. Counting a window opened near the end in full keeps utilization at or below 100%, at the cost of looking a little worse on short runs.
+- **Utilization counts only windows that reset inside the run.** Windows start on the first request after a reset, so they drift with traffic, and the last one is often cut off by the end of the run. (At first every window started was counted in full, which made runs show exactly 75% when a 4th window opened in the last few seconds. Fixed on 2026-10-20.)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -47,7 +48,12 @@ func TestServerHeadersAndStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Stats{Requests: 3, OK: 2, Primary403: 1, Violations: 1, Windows: 1}
-	if got := stats["token abc"]; got != want {
+	got := stats["token abc"]
+	if len(got.WindowOK) != 1 || got.WindowOK[0] != 2 || got.WindowResets[0] != 1792411260 {
+		t.Fatalf("per-window stats = %v %v; want [1792411260] [2]", got.WindowResets, got.WindowOK)
+	}
+	got.WindowResets, got.WindowOK = nil, nil
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("stats = %+v, want %+v", got, want)
 	}
 }
