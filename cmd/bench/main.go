@@ -81,6 +81,7 @@ func main() {
 	if hold == 0 {
 		hold = *window / 120
 	}
+	minute := *window / 60 // GitHub's minute, scaled like the hour
 
 	type job struct {
 		setting
@@ -107,10 +108,15 @@ func main() {
 				target := "http://" + addr
 				var proxy *exec.Cmd
 				if *viaProxy {
-					// Both programs share this machine's clock, so no reset guard.
+					// Both programs share this machine's clock, so no reset
+					// guard. The secondary limits are the fake server's, as
+					// GitHub's published numbers would be in production.
 					proxy = exec.Command(filepath.Join(*bin, "quotad"),
 						"-listen", proxyAddr, "-upstream", target,
-						"-max-hold", hold.String(), "-reset-guard", "0")
+						"-max-hold", hold.String(), "-reset-guard", "0",
+						"-max-in-flight", strconv.Itoa(*concurrency),
+						"-points", strconv.Itoa(max(5, 900**budget/5000)), "-points-window", minute.String(),
+						"-min-pause", minute.String())
 					proxy.Stderr = os.Stderr
 					if err := proxy.Start(); err != nil {
 						log.Fatal(err)
@@ -181,7 +187,7 @@ func main() {
 	}
 
 	if *viaProxy {
-		fmt.Printf("Through quotad (max hold %v, reset guard 0). ", hold)
+		fmt.Printf("Through quotad (max hold %v, reset guard 0, %d in flight, %d points per %v). ", hold, *concurrency, max(5, 900**budget/5000), minute)
 	}
 	fmt.Printf("%d agents (%d polling), budget %d per %v, %d in flight, %v latency, %d windows per run, %d runs per row. Cells are mean [min–max].\n\n",
 		*nAgents, *pollers, *budget, *window, *concurrency, *latency, *windows, *runs)
