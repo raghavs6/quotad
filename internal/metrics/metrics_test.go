@@ -25,10 +25,10 @@ func TestUnfinishedCallsCountAtRunEnd(t *testing.T) {
 	r := NewRecorder(start)
 	for i := range 9 {
 		w := start.Add(time.Duration(i) * time.Second)
-		r.Critical(w, w.Add(100*time.Millisecond))
+		r.Critical("core", w, w, w.Add(100*time.Millisecond))
 	}
 	// One call wanted at 0s never finished; the run ended at 30s.
-	r.Critical(start, time.Time{})
+	r.Critical("core", start, time.Time{}, time.Time{})
 
 	s := r.Summarize(start.Add(30 * time.Second))
 	if s.CriticalDone != 9 || s.CriticalUnfinished != 1 {
@@ -36,6 +36,37 @@ func TestUnfinishedCallsCountAtRunEnd(t *testing.T) {
 	}
 	if s.CriticalP95 != 30 {
 		t.Fatalf("p95 = %v, want 30 (the stuck call counted at run end)", s.CriticalP95)
+	}
+}
+
+func TestWaitsSplitByResource(t *testing.T) {
+	start := time.Unix(1000, 0)
+	r := NewRecorder(start)
+	ms := func(n int) time.Time { return start.Add(time.Duration(n) * time.Millisecond) }
+	// Core: wanted at 0, stuck behind the agent's search until 2000, then
+	// done 100ms after it was sent.
+	r.Critical("core", ms(0), ms(2000), ms(2100))
+	// Search: sent at once, held 2s.
+	r.Critical("search", ms(0), ms(0), ms(2000))
+	// Search: sent at 5000, still held when the run ends at 10000.
+	r.Critical("search", ms(4000), ms(5000), time.Time{})
+	// Wanted but never sent, resource unknown: totals only.
+	r.Critical("", ms(9000), time.Time{}, time.Time{})
+
+	s := r.Summarize(ms(10000))
+	if s.CriticalDone != 2 || s.CriticalUnfinished != 2 {
+		t.Fatalf("totals: done %d unfinished %d, want 2, 2", s.CriticalDone, s.CriticalUnfinished)
+	}
+	if len(s.Resources) != 2 {
+		t.Fatalf("resources = %v, want core and search only", s.Resources)
+	}
+	core := s.Resources["core"]
+	if core.Done != 1 || core.Unfinished != 0 || core.WaitP95 != 2.1 || core.CallP95 != 0.1 {
+		t.Errorf("core = %+v, want 1 done, wait 2.1s, call 0.1s", core)
+	}
+	search := s.Resources["search"]
+	if search.Done != 1 || search.Unfinished != 1 || search.WaitP95 != 6 || search.CallP50 != 2 || search.CallP95 != 5 {
+		t.Errorf("search = %+v, want 1 done, 1 unfinished, wait p95 6s, call p50 2s, p95 5s", search)
 	}
 }
 

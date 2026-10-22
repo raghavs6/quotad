@@ -123,33 +123,43 @@ func (a *agent) taskStream(ctx context.Context, rng *rand.Rand) {
 	// Start at a random point in the first gap, so agents don't all fire
 	// their first call at the same instant.
 	wanted := time.Now().Add(time.Duration(rng.Float64() * float64(a.cfg.TaskGap)))
+	// pick draws the next task call, and the resource it spends.
+	pick := func() (method, path, resource string) {
+		method, path, resource = http.MethodGet, or(a.cfg.ReadPath, "/repos/o/r/contents/file.go"), "core"
+		// Draw for a search only when searches are on, so runs without
+		// them see the same random numbers as before.
+		if a.cfg.SearchFrac > 0 && rng.Float64() < a.cfg.SearchFrac {
+			path, resource = or(a.cfg.SearchPath, "/search/issues?q=repo:o/r"), "search"
+		} else if rng.Float64() < a.cfg.WriteFrac {
+			method, path = http.MethodPost, or(a.cfg.WritePath, "/repos/o/r/issues/1/comments")
+		}
+		return method, path, resource
+	}
 	for {
 		if !sleep(ctx, time.Until(wanted)) {
 			return
 		}
-		method, path := http.MethodGet, or(a.cfg.ReadPath, "/repos/o/r/contents/file.go")
-		// Draw for a search only when searches are on, so runs without
-		// them see the same random numbers as before.
-		if a.cfg.SearchFrac > 0 && rng.Float64() < a.cfg.SearchFrac {
-			path = or(a.cfg.SearchPath, "/search/issues?q=repo:o/r")
-		} else if rng.Float64() < a.cfg.WriteFrac {
-			method, path = http.MethodPost, or(a.cfg.WritePath, "/repos/o/r/issues/1/comments")
-		}
-		if !a.do(ctx, rng, method, path) {
+		method, path, resource := pick()
+		var sent time.Time
+		if !a.do(ctx, rng, method, path, &sent) {
+			// The run ended with this call unfinished, sent or not.
+			a.rec.Critical(resource, wanted, sent, time.Time{})
+			wanted = wanted.Add(gap())
 			break
 		}
-		a.rec.Critical(wanted, time.Now())
+		a.rec.Critical(resource, wanted, sent, time.Now())
 		wanted = wanted.Add(gap())
 	}
 
-	// The run ended. Record the call in flight and every call the schedule
-	// wanted before the end as unfinished.
+	// The run ended. Record every later call the schedule wanted before the
+	// end as unfinished, each drawn as it would have been.
 	end, ok := ctx.Deadline()
 	if !ok {
 		end = time.Now()
 	}
 	for ; wanted.Before(end); wanted = wanted.Add(gap()) {
-		a.rec.Critical(wanted, time.Time{})
+		_, _, resource := pick()
+		a.rec.Critical(resource, wanted, time.Time{}, time.Time{})
 	}
 }
 
@@ -157,7 +167,7 @@ func (a *agent) taskStream(ctx context.Context, rng *rand.Rand) {
 func (a *agent) poll(ctx context.Context, rng *rand.Rand) {
 	sleep(ctx, time.Duration(rng.Float64()*float64(a.cfg.PollEvery)))
 	for ctx.Err() == nil {
-		if !a.do(ctx, rng, http.MethodGet, or(a.cfg.PollPath, "/repos/o/r/actions/runs")) {
+		if !a.do(ctx, rng, http.MethodGet, or(a.cfg.PollPath, "/repos/o/r/actions/runs"), nil) {
 			return
 		}
 		sleep(ctx, a.cfg.PollEvery)
@@ -165,13 +175,17 @@ func (a *agent) poll(ctx context.Context, rng *rand.Rand) {
 }
 
 // do sends one call, retrying until it succeeds. It returns false only if
-// ctx ended first.
-func (a *agent) do(ctx context.Context, rng *rand.Rand, method, path string) bool {
+// ctx ended first. If sent isn't nil, do sets it to when the call first
+// went out, after any pause the agent's own headers called for.
+func (a *agent) do(ctx context.Context, rng *rand.Rand, method, path string, sent *time.Time) bool {
 	for attempt := 0; ; attempt++ {
 		if a.cfg.Strategy == HeaderAware {
 			if !sleep(ctx, time.Until(a.blockedUntil())) {
 				return false
 			}
+		}
+		if sent != nil && sent.IsZero() {
+			*sent = time.Now()
 		}
 
 		status, h, err := a.send(ctx, method, path)

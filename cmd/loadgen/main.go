@@ -26,13 +26,14 @@ import (
 
 // Result is one run, as printed with -json.
 type Result struct {
-	Strategy    string          `json:"strategy"`
-	Demand      float64         `json:"demand"`
-	Seed        uint64          `json:"seed"`
-	Server      fake.Stats      `json:"server"`
-	Utilization float64         `json:"utilization"` // successful core requests ÷ budget, over windows that fit in the run
-	SearchUtil  float64         `json:"search_utilization,omitempty"`
-	Agents      metrics.Summary `json:"agents"`
+	Strategy     string          `json:"strategy"`
+	Demand       float64         `json:"demand"`
+	SearchDemand float64         `json:"search_demand,omitempty"`
+	Seed         uint64          `json:"seed"`
+	Server       fake.Stats      `json:"server"`
+	Utilization  float64         `json:"utilization"` // successful core requests ÷ budget, over windows that fit in the run
+	SearchUtil   float64         `json:"search_utilization,omitempty"`
+	Agents       metrics.Summary `json:"agents"`
 }
 
 func main() {
@@ -111,7 +112,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	res := Result{Strategy: strategy.String(), Demand: *demand, Seed: *seed, Server: server, Agents: rec.Summarize(end)}
+	res := Result{Strategy: strategy.String(), Demand: *demand, SearchDemand: *searchDemand, Seed: *seed, Server: server, Agents: rec.Summarize(end)}
 	res.Utilization = utilization(server.WindowResets, server.WindowOK, *budget, end)
 	if s := server.Search; s != nil {
 		res.SearchUtil = utilization(s.WindowResets, s.WindowOK, *searchBudget, end)
@@ -130,6 +131,12 @@ func main() {
 		a.PeakRejectionsPerS, 100*a.PostResetShare, metrics.PostResetSpan)
 	fmt.Printf("  critical wait       p50 %.2fs, p95 %.2fs (%d done, %d unfinished)\n",
 		a.CriticalP50, a.CriticalP95, a.CriticalDone, a.CriticalUnfinished)
+	for _, name := range []string{"core", "search"} {
+		if r, ok := a.Resources[name]; ok {
+			fmt.Printf("    %-6s            wait p50 %.2fs, p95 %.2fs; call p50 %.2fs, p95 %.2fs (%d done, %d unfinished)\n",
+				name, r.WaitP50, r.WaitP95, r.CallP50, r.CallP95, r.Done, r.Unfinished)
+		}
+	}
 	fmt.Printf("  utilization         %.0f%% (%d ok, %d windows started)\n", 100*res.Utilization, server.OK, server.Windows)
 	if s := server.Search; s != nil {
 		fmt.Printf("  search              %d ok, %d 403s, %.0f%% utilization\n", s.OK, s.Primary403, 100*res.SearchUtil)

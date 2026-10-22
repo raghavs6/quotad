@@ -47,7 +47,7 @@ func TestHeaderAwarePausesUntilReset(t *testing.T) {
 	waitForFreshWindow()
 
 	for i := range 3 {
-		if !a.do(context.Background(), rng, http.MethodGet, "/x") {
+		if !a.do(context.Background(), rng, http.MethodGet, "/x", nil) {
 			t.Fatalf("call %d failed", i)
 		}
 	}
@@ -65,7 +65,7 @@ func TestHeaderAwareObeysRetryAfter(t *testing.T) {
 
 	begin := time.Now()
 	for range 2 {
-		if !a.do(context.Background(), rng, http.MethodPost, "/x") {
+		if !a.do(context.Background(), rng, http.MethodPost, "/x", nil) {
 			t.Fatal("write failed")
 		}
 	}
@@ -85,7 +85,7 @@ func TestBackoffIgnoresHeaders(t *testing.T) {
 	waitForFreshWindow()
 
 	for i := range 3 {
-		if !a.do(context.Background(), rng, http.MethodGet, "/x") {
+		if !a.do(context.Background(), rng, http.MethodGet, "/x", nil) {
 			t.Fatalf("call %d failed", i)
 		}
 	}
@@ -135,5 +135,38 @@ func TestRunStopsAndRecordsUnfinished(t *testing.T) {
 	// a wait close to the 400ms between then and the end.
 	if s.CriticalP95 < 0.25 {
 		t.Fatalf("p95 = %.2fs, want the unfinished calls' waits counted", s.CriticalP95)
+	}
+}
+
+func TestTaskCallsRecordedByResource(t *testing.T) {
+	l, _ := fake.NewLimiter(fake.Config{Budget: 1000, Window: 60 * time.Second, MaxConcurrent: 100, Points: 1000, PointsWindow: time.Second,
+		SearchBudget: 1000, SearchWindow: time.Second}, time.Now)
+	srv := httptest.NewServer(fake.NewServer(l, 10*time.Millisecond))
+	defer srv.Close()
+
+	rec := metrics.NewRecorder(time.Now())
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	Run(ctx, Config{
+		BaseURL: srv.URL, Token: "t", Strategy: Backoff,
+		Agents: 2, TaskGap: 20 * time.Millisecond, SearchFrac: 0.5,
+		BaseBackoff: time.Second, MaxBackoff: time.Second, Seed: 1,
+	}, srv.Client(), rec)
+
+	s := rec.Summarize(time.Now())
+	core, search := s.Resources["core"], s.Resources["search"]
+	if core.Done == 0 || search.Done == 0 {
+		t.Fatalf("resources = %+v, want core and search calls", s.Resources)
+	}
+	if core.Done+search.Done != s.CriticalDone || core.Unfinished+search.Unfinished != s.CriticalUnfinished {
+		t.Fatalf("resources = %+v don't add up to the totals (%d done, %d unfinished)", s.Resources, s.CriticalDone, s.CriticalUnfinished)
+	}
+	// Nothing is ever rejected here, so a call takes about the server's 10ms.
+	if core.CallP95 > 0.1 || search.CallP95 > 0.1 {
+		t.Fatalf("call p95 core %.3fs search %.3fs, want about 0.01s", core.CallP95, search.CallP95)
+	}
+	// The server may finish a search the agent was cut off from at the end.
+	if got := l.Stats()["token t"].Search; got == nil || got.OK < search.Done || got.OK > search.Done+search.Unfinished {
+		t.Fatalf("server counted searches %+v, agents %+v", got, search)
 	}
 }
