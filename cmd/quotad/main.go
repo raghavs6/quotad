@@ -1,7 +1,7 @@
 // Command quotad is the rate-limit governor proxy. Agents point their API
-// base URL at it. It learns each token's primary budget from the upstream's
-// x-ratelimit-* headers, keeps each token under the secondary limits, and
-// holds requests until they fit.
+// base URL at it. It learns each token's primary budgets, one per resource
+// (core, search, ...), from the upstream's x-ratelimit-* headers, keeps each
+// token under the secondary limits, and holds requests until they fit.
 package main
 
 import (
