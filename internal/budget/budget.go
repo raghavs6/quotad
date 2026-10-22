@@ -61,6 +61,11 @@ type Config struct {
 	// no retry-after (GitHub: at least a minute). Each further such answer
 	// in a row doubles it.
 	MinPause time.Duration
+
+	// Lease is how long a request admitted through Redis may go unanswered
+	// before it counts as failed, so a crashed copy's reservations end.
+	// Only NewRedis uses it.
+	Lease time.Duration
 }
 
 // Point costs, from GitHub's secondary-limit rules.

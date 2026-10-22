@@ -1,15 +1,19 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/raghavs6/quotad/internal/budget"
 	"github.com/raghavs6/quotad/internal/fake"
+	"github.com/redis/go-redis/v9"
 )
 
 // These tests put the proxy in front of the real fake server with a 1s
@@ -29,7 +33,7 @@ func setupFake(t *testing.T, fc fake.Config, cfg budget.Config) (*httptest.Serve
 	upstream := httptest.NewServer(fake.NewServer(l, 10*time.Millisecond))
 	t.Cleanup(upstream.Close)
 	u, _ := url.Parse(upstream.URL)
-	p := httptest.NewServer(New(u, cfg))
+	p := httptest.NewServer(New(u, cfg, nil))
 	t.Cleanup(p.Close)
 	return p, l
 }
@@ -135,7 +139,7 @@ func TestSecondary429PausesTheToken(t *testing.T) {
 	}))
 	defer upstream.Close()
 	u, _ := url.Parse(upstream.URL)
-	p := httptest.NewServer(New(u, budget.Config{MaxHold: 5 * time.Second}))
+	p := httptest.NewServer(New(u, budget.Config{MaxHold: 5 * time.Second}, nil))
 	defer p.Close()
 
 	if c := get(t, p.URL).StatusCode; c != http.StatusTooManyRequests {
@@ -163,5 +167,63 @@ func TestClassifyResource(t *testing.T) {
 		if got := classifyResource(path); got != want {
 			t.Errorf("classifyResource(%q) = %q, want %q", path, got, want)
 		}
+	}
+}
+
+func TestTwoCopiesShareOneBudgetThroughRedis(t *testing.T) {
+	addr := os.Getenv("QUOTAD_TEST_REDIS")
+	if addr == "" {
+		t.Skip("QUOTAD_TEST_REDIS not set")
+	}
+	opt, err := redis.ParseURL(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rdb := redis.NewClient(opt)
+	t.Cleanup(func() { rdb.Close() })
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := fake.NewLimiter(fake.Config{Budget: 3, Window: time.Second, MaxConcurrent: 100, Points: 1000, PointsWindow: time.Second}, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := httptest.NewServer(fake.NewServer(l, 10*time.Millisecond))
+	t.Cleanup(upstream.Close)
+	u, _ := url.Parse(upstream.URL)
+	cfg := budget.Config{MaxHold: 3 * time.Second}
+	copies := []*httptest.Server{httptest.NewServer(New(u, cfg, rdb)), httptest.NewServer(New(u, cfg, rdb))}
+	for _, c := range copies {
+		t.Cleanup(c.Close)
+	}
+
+	// A fresh token, so keys left in Redis by an earlier run don't count.
+	token := "token redis-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	var wg sync.WaitGroup
+	codes := make([]int, 8)
+	for i := range codes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, _ := http.NewRequest(http.MethodGet, copies[i%2].URL+"/repos/o/r", nil)
+			req.Header.Set("Authorization", token)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			resp.Body.Close()
+			codes[i] = resp.StatusCode
+		}()
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Errorf("request %d: status %d, want 200", i, c)
+		}
+	}
+	if st := l.Stats()[token]; st.Violations != 0 || st.Primary403 != 0 || st.OK != 8 {
+		t.Fatalf("server stats = %+v; want 8 ok and no violations across both copies", st)
 	}
 }

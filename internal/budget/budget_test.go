@@ -78,6 +78,8 @@ func state(t *testing.T, b *Budget, res string) snap {
 			s.known, s.remaining, s.reserved = r.known, r.remaining, r.reserved
 		}
 		return s
+	case *redisCounts:
+		return redisState(t, c, res)
 	}
 	t.Fatalf("no state for %T", b.c)
 	return snap{}
@@ -102,6 +104,9 @@ func newTestWith(cfg Config) (*Budget, *fakeTime) {
 	}
 	if cfg.MinPause == 0 {
 		cfg.MinPause = time.Minute
+	}
+	if testRedis != nil {
+		return newRedisTest(cfg, c, randomToken()), c
 	}
 	return New(cfg, c.now, c.schedule), c
 }
