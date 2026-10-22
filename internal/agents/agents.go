@@ -55,15 +55,16 @@ type Config struct {
 	Token    string
 	Strategy Strategy
 
-	Agents    int           // agents running a task stream (critical calls)
-	Pollers   int           // the first Pollers agents also poll CI (background calls)
-	TaskGap   time.Duration // mean time between the starts of an agent's task calls
-	PollEvery time.Duration // pause between a poller's calls
-	WriteFrac float64       // share of task calls that are writes
+	Agents     int           // agents running a task stream (critical calls)
+	Pollers    int           // the first Pollers agents also poll CI (background calls)
+	TaskGap    time.Duration // mean time between the starts of an agent's task calls
+	PollEvery  time.Duration // pause between a poller's calls
+	WriteFrac  float64       // share of task calls that are writes, among those that aren't searches
+	SearchFrac float64       // share of task calls that are searches
 
-	// Paths to call; empty means the fake server's paths. ReadPath
-	// may carry a query string.
-	ReadPath, WritePath, PollPath string
+	// Paths to call; empty means the fake server's paths. ReadPath and
+	// SearchPath may carry a query string.
+	ReadPath, WritePath, PollPath, SearchPath string
 
 	BaseBackoff time.Duration // first backoff step
 	MaxBackoff  time.Duration // backoff cap
@@ -127,7 +128,11 @@ func (a *agent) taskStream(ctx context.Context, rng *rand.Rand) {
 			return
 		}
 		method, path := http.MethodGet, or(a.cfg.ReadPath, "/repos/o/r/contents/file.go")
-		if rng.Float64() < a.cfg.WriteFrac {
+		// Draw for a search only when searches are on, so runs without
+		// them see the same random numbers as before.
+		if a.cfg.SearchFrac > 0 && rng.Float64() < a.cfg.SearchFrac {
+			path = or(a.cfg.SearchPath, "/search/issues?q=repo:o/r")
+		} else if rng.Float64() < a.cfg.WriteFrac {
 			method, path = http.MethodPost, or(a.cfg.WritePath, "/repos/o/r/issues/1/comments")
 		}
 		if !a.do(ctx, rng, method, path) {

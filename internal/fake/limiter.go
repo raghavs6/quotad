@@ -3,6 +3,9 @@
 // The rules follow GitHub's REST API, with sizes and windows we choose:
 //   - Primary limit: Budget requests per Window, per token. Over it: 403
 //     with x-ratelimit-remaining: 0.
+//   - Like GitHub, search has its own primary limit: SearchBudget requests
+//     per SearchWindow, counted apart from core. With SearchBudget 0, there
+//     is no search resource and searches count as core.
 //   - Secondary limits: at most MaxConcurrent requests in flight, and at most
 //     Points points per PointsWindow (read = 1, write = 5). Over them: 429
 //     with retry-after.
@@ -15,6 +18,7 @@ import (
 	"math"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -25,14 +29,23 @@ const (
 	WriteCost = 5
 )
 
-// Config sets the limits. Window must be a whole number of seconds so that
-// reset times, which GitHub sends as whole epoch seconds, are exact.
+// Resources, as named in the x-ratelimit-resource header.
+const (
+	Core   = "core"
+	Search = "search"
+)
+
+// Config sets the limits. Window and SearchWindow must be whole numbers of
+// seconds so that reset times, which GitHub sends as whole epoch seconds,
+// are exact.
 type Config struct {
 	Budget        int
 	Window        time.Duration
 	MaxConcurrent int
 	Points        int
 	PointsWindow  time.Duration
+	SearchBudget  int // 0 = no search resource
+	SearchWindow  time.Duration
 }
 
 // Validate reports a config the limiter can't run with.
@@ -48,6 +61,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("points must be at least %d, got %d", WriteCost, c.Points)
 	case c.PointsWindow <= 0:
 		return fmt.Errorf("points window must be positive, got %v", c.PointsWindow)
+	case c.SearchBudget < 0:
+		return fmt.Errorf("search budget can't be negative, got %d", c.SearchBudget)
+	case c.SearchBudget > 0 && (c.SearchWindow < time.Second || c.SearchWindow%time.Second != 0):
+		return fmt.Errorf("search window must be a whole number of seconds, got %v", c.SearchWindow)
 	}
 	return nil
 }
@@ -55,6 +72,7 @@ func (c Config) Validate() error {
 // Decision is the limiter's answer to one request.
 type Decision struct {
 	Status     int // http.StatusOK, StatusForbidden (primary) or StatusTooManyRequests (secondary)
+	Resource   string
 	Limit      int
 	Remaining  int
 	Used       int
@@ -63,7 +81,8 @@ type Decision struct {
 	Violation  bool      // the token was already limited when this request arrived
 }
 
-// Stats counts what happened to one token.
+// Stats counts what happened to one token. The counts cover every
+// resource; the window fields are core's.
 type Stats struct {
 	Requests     int `json:"requests"`
 	OK           int `json:"ok"`
@@ -75,11 +94,29 @@ type Stats struct {
 	// requests succeeded in it. Used to compute utilization over full windows.
 	WindowResets []int64 `json:"window_resets"`
 	WindowOK     []int   `json:"window_ok"`
+
+	Search *ResourceStats `json:"search,omitempty"` // only if a search was sent
+}
+
+// ResourceStats counts one resource apart from core.
+type ResourceStats struct {
+	Requests     int     `json:"requests"`
+	OK           int     `json:"ok"`
+	Primary403   int     `json:"primary_403"`
+	Violations   int     `json:"violations"`
+	WindowResets []int64 `json:"window_resets"`
+	WindowOK     []int   `json:"window_ok"`
+}
+
+// primary is one resource's primary window.
+type primary struct {
+	used    int
+	resetAt time.Time
 }
 
 type tokenState struct {
-	used     int
-	resetAt  time.Time
+	core     primary
+	search   primary
 	points   int
 	pointsAt time.Time // when the points window resets
 	inflight int
@@ -105,10 +142,19 @@ func NewLimiter(cfg Config, now func() time.Time) (*Limiter, error) {
 	return &Limiter{cfg: cfg, now: now, tokens: map[string]*tokenState{}}, nil
 }
 
-// Begin decides one request. If the request is admitted (Status 200), the
-// caller must call the returned release func when the request finishes, so
-// it stops counting toward the concurrency limit. release is nil otherwise.
-func (l *Limiter) Begin(token string, write bool) (d Decision, release func()) {
+// Resource names the resource a request to path counts against.
+func (l *Limiter) Resource(path string) string {
+	if l.cfg.SearchBudget > 0 && strings.HasPrefix(path, "/search/") {
+		return Search
+	}
+	return Core
+}
+
+// Begin decides one request to resource (Core, or Search if configured). If
+// the request is admitted (Status 200), the caller must call the returned
+// release func when the request finishes, so it stops counting toward the
+// concurrency limit. release is nil otherwise.
+func (l *Limiter) Begin(token, resource string, write bool) (d Decision, release func()) {
 	cost := ReadCost
 	if write {
 		cost = WriteCost
@@ -124,14 +170,29 @@ func (l *Limiter) Begin(token string, write bool) (d Decision, release func()) {
 		l.tokens[token] = st
 	}
 
+	// The resource's primary window, and where its per-window counts go.
+	p, budget, window := &st.core, l.cfg.Budget, l.cfg.Window
+	resets, oks := &st.stats.WindowResets, &st.stats.WindowOK
+	var rs *ResourceStats
+	if resource == Search {
+		if st.stats.Search == nil {
+			st.stats.Search = &ResourceStats{}
+		}
+		rs = st.stats.Search
+		p, budget, window = &st.search, l.cfg.SearchBudget, l.cfg.SearchWindow
+		resets, oks = &rs.WindowResets, &rs.WindowOK
+	}
+
 	// Like GitHub, a window starts with the first request after the last one
 	// ended. We start it on a whole second so the reset header is exact.
-	if !t.Before(st.resetAt) {
-		st.resetAt = t.Truncate(time.Second).Add(l.cfg.Window)
-		st.used = 0
-		st.stats.Windows++
-		st.stats.WindowResets = append(st.stats.WindowResets, st.resetAt.Unix())
-		st.stats.WindowOK = append(st.stats.WindowOK, 0)
+	if !t.Before(p.resetAt) {
+		p.resetAt = t.Truncate(time.Second).Add(window)
+		p.used = 0
+		if rs == nil {
+			st.stats.Windows++
+		}
+		*resets = append(*resets, p.resetAt.Unix())
+		*oks = append(*oks, 0)
 	}
 	if !t.Before(st.pointsAt) {
 		st.pointsAt = t.Add(l.cfg.PointsWindow)
@@ -139,16 +200,22 @@ func (l *Limiter) Begin(token string, write bool) (d Decision, release func()) {
 	}
 
 	st.stats.Requests++
-	d.Violation = st.used >= l.cfg.Budget || t.Before(st.penalty)
+	d.Violation = p.used >= budget || t.Before(st.penalty)
 	if d.Violation {
 		st.stats.Violations++
+	}
+	if rs != nil {
+		rs.Requests++
+		if d.Violation {
+			rs.Violations++
+		}
 	}
 
 	switch {
 	case t.Before(st.penalty):
 		d.Status = http.StatusTooManyRequests
 		d.RetryAfter = ceilSeconds(st.penalty.Sub(t))
-	case st.used >= l.cfg.Budget:
+	case p.used >= budget:
 		d.Status = http.StatusForbidden
 	case st.inflight >= l.cfg.MaxConcurrent:
 		d.Status = http.StatusTooManyRequests
@@ -160,11 +227,14 @@ func (l *Limiter) Begin(token string, write bool) (d Decision, release func()) {
 		st.penalize(t, d.RetryAfter)
 	default:
 		d.Status = http.StatusOK
-		st.used++
+		p.used++
 		st.points += cost
 		st.inflight++
 		st.stats.OK++
-		st.stats.WindowOK[len(st.stats.WindowOK)-1]++
+		(*oks)[len(*oks)-1]++
+		if rs != nil {
+			rs.OK++
+		}
 		release = sync.OnceFunc(func() {
 			l.mu.Lock()
 			st.inflight--
@@ -175,14 +245,18 @@ func (l *Limiter) Begin(token string, write bool) (d Decision, release func()) {
 	switch d.Status {
 	case http.StatusForbidden:
 		st.stats.Primary403++
+		if rs != nil {
+			rs.Primary403++
+		}
 	case http.StatusTooManyRequests:
 		st.stats.Secondary429++
 	}
 
-	d.Limit = l.cfg.Budget
-	d.Used = st.used
-	d.Remaining = l.cfg.Budget - st.used
-	d.Reset = st.resetAt
+	d.Resource = resource
+	d.Limit = budget
+	d.Used = p.used
+	d.Remaining = budget - p.used
+	d.Reset = p.resetAt
 	return d, release
 }
 
@@ -195,6 +269,12 @@ func (l *Limiter) Stats() map[string]Stats {
 		s := st.stats
 		s.WindowResets = slices.Clone(s.WindowResets)
 		s.WindowOK = slices.Clone(s.WindowOK)
+		if s.Search != nil {
+			rs := *s.Search
+			rs.WindowResets = slices.Clone(rs.WindowResets)
+			rs.WindowOK = slices.Clone(rs.WindowOK)
+			s.Search = &rs
+		}
 		out[tok] = s
 	}
 	return out

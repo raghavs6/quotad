@@ -6,6 +6,10 @@
 // With -proxy, quotad sits between loadgen and fakegithub. Violations are
 // still counted by fakegithub, so they mean the same thing either way.
 //
+// With -searches, the agents also search, at the same demand multiple of
+// the search budget (GitHub's 30 a minute, scaled like the rest). Search is
+// its own resource, so this tests mixed traffic on one token.
+//
 // Build the programs first: go build -o bin/ ./cmd/...
 package main
 
@@ -39,6 +43,7 @@ type run struct {
 		Secondary429 int `json:"secondary_429"`
 	} `json:"server"`
 	Utilization float64         `json:"utilization"`
+	SearchUtil  float64         `json:"search_utilization"`
 	Agents      metrics.Summary `json:"agents"`
 }
 
@@ -64,6 +69,7 @@ func main() {
 	out := flag.String("out", "results/bench.jsonl", "where to save every run")
 	viaProxy := flag.Bool("proxy", false, "put quotad between the agents and the fake server")
 	maxHold := flag.Duration("max-hold", 0, "quotad's max hold (0 = window/120, GitHub's 30s per hour scaled)")
+	searches := flag.Bool("searches", false, "agents also search, at the same demand multiple of the search budget")
 	flag.Parse()
 
 	var settings []setting
@@ -82,6 +88,7 @@ func main() {
 		hold = *window / 120
 	}
 	minute := *window / 60 // GitHub's minute, scaled like the hour
+	searchBudget := max(1, 30**budget/5000)
 
 	type job struct {
 		setting
@@ -99,7 +106,8 @@ func main() {
 			for j := range jobs {
 				server := exec.Command(filepath.Join(*bin, "fakegithub"),
 					"-addr", addr, "-budget", strconv.Itoa(*budget), "-window", window.String(),
-					"-concurrency", strconv.Itoa(*concurrency), "-latency", latency.String())
+					"-concurrency", strconv.Itoa(*concurrency), "-latency", latency.String(),
+					"-search-budget", strconv.Itoa(searchBudget), "-search-window", minute.String())
 				server.Stderr = os.Stderr
 				if err := server.Start(); err != nil {
 					log.Fatal(err)
@@ -125,8 +133,14 @@ func main() {
 					target = "http://" + proxyAddr
 				}
 
+				searchDemand := 0.0
+				if *searches {
+					searchDemand = j.demand
+				}
 				var stdout bytes.Buffer
 				lg := exec.Command(filepath.Join(*bin, "loadgen"), "-json",
+					"-search-demand", strconv.FormatFloat(searchDemand, 'g', -1, 64),
+					"-search-budget", strconv.Itoa(searchBudget), "-search-window", minute.String(),
 					"-target", target, "-stats", "http://"+addr+"/__stats", "-strategy", j.strategy,
 					"-demand", strconv.FormatFloat(j.demand, 'g', -1, 64),
 					"-budget", strconv.Itoa(*budget), "-window", window.String(), "-latency", latency.String(),
@@ -191,8 +205,13 @@ func main() {
 	}
 	fmt.Printf("%d agents (%d polling), budget %d per %v, %d in flight, %v latency, %d windows per run, %d runs per row. Cells are mean [min–max].\n\n",
 		*nAgents, *pollers, *budget, *window, *concurrency, *latency, *windows, *runs)
-	fmt.Println("| demand | strategy | violations | 403s | 429s | peak rejections/s | rejections ≤2s after reset | critical p50 (s) | critical p95 (s) | unfinished critical | utilization |")
-	fmt.Println("|---|---|---|---|---|---|---|---|---|---|---|")
+	searchCol, searchSep := "", ""
+	if *searches {
+		fmt.Printf("Agents also search: %d searches per %v, at the same demand multiple. Utilization is core's.\n\n", searchBudget, minute)
+		searchCol, searchSep = " search utilization |", "---|"
+	}
+	fmt.Println("| demand | strategy | violations | 403s | 429s | peak rejections/s | rejections ≤2s after reset | critical p50 (s) | critical p95 (s) | unfinished critical | utilization |" + searchCol)
+	fmt.Println("|---|---|---|---|---|---|---|---|---|---|---|" + searchSep)
 	for _, s := range settings {
 		rs := bySetting[s]
 		col := func(f func(run) float64, format string) string {
@@ -203,7 +222,11 @@ func main() {
 			g := metrics.RangeOf(xs)
 			return fmt.Sprintf(format+" ["+format+"–"+format+"]", g.Mean, g.Min, g.Max)
 		}
-		fmt.Printf("| %.2gx | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", s.demand, s.strategy,
+		search := ""
+		if *searches {
+			search = " " + col(func(r run) float64 { return 100 * r.SearchUtil }, "%.0f%%") + " |"
+		}
+		fmt.Printf("| %.2gx | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |%s\n", s.demand, s.strategy,
 			col(func(r run) float64 { return float64(r.Server.Violations) }, "%.0f"),
 			col(func(r run) float64 { return float64(r.Server.Primary403) }, "%.0f"),
 			col(func(r run) float64 { return float64(r.Server.Secondary429) }, "%.0f"),
@@ -213,6 +236,7 @@ func main() {
 			col(func(r run) float64 { return r.Agents.CriticalP95 }, "%.2f"),
 			col(func(r run) float64 { return float64(r.Agents.CriticalUnfinished) }, "%.0f"),
 			col(func(r run) float64 { return 100 * r.Utilization }, "%.0f%%"),
+			search,
 		)
 	}
 }
