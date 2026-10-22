@@ -9,6 +9,7 @@ import (
 
 // Server answers like GitHub's REST API, enforcing the limiter's rules.
 // Any path works; GET, HEAD and OPTIONS are reads, everything else a write.
+// Paths under /search/ count against the search resource, if configured.
 // GET /__stats returns every token's counters as JSON.
 type Server struct {
 	limiter *Limiter
@@ -29,7 +30,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	write := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
-	d, release := s.limiter.Begin(r.Header.Get("Authorization"), write)
+	d, release := s.limiter.Begin(r.Header.Get("Authorization"), s.limiter.Resource(r.URL.Path), write)
 
 	h := w.Header()
 	h.Set("Content-Type", "application/json")
@@ -37,7 +38,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("x-ratelimit-remaining", strconv.Itoa(d.Remaining))
 	h.Set("x-ratelimit-used", strconv.Itoa(d.Used))
 	h.Set("x-ratelimit-reset", strconv.FormatInt(d.Reset.Unix(), 10))
-	h.Set("x-ratelimit-resource", "core")
+	h.Set("x-ratelimit-resource", d.Resource)
 
 	switch d.Status {
 	case http.StatusOK:

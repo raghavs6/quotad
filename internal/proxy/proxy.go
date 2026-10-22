@@ -6,10 +6,12 @@ package proxy
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +31,13 @@ type Proxy struct {
 
 type ticketKey struct{}
 
+// held is what a request carries through the reverse proxy: its ticket and
+// the resource it was guessed to count against.
+type held struct {
+	t   *budget.Ticket
+	res string
+}
+
 // New returns a proxy to upstream.
 func New(upstream *url.URL, cfg budget.Config) *Proxy {
 	p := &Proxy{cfg: cfg, now: time.Now, schedule: budget.AfterFunc, budgets: map[string]*budget.Budget{}}
@@ -42,12 +51,16 @@ func New(upstream *url.URL, cfg budget.Config) *Proxy {
 			IdleConnTimeout:     90 * time.Second,
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			ticket(resp.Request.Context()).Done(resp.StatusCode, resp.Header)
+			h := heldFor(resp.Request.Context())
+			if got := resp.Header.Get("x-ratelimit-resource"); got != "" && got != h.res {
+				log.Printf("quotad: %s %s counted against %q, guessed %q", resp.Request.Method, resp.Request.URL.Path, got, h.res)
+			}
+			h.t.Done(resp.StatusCode, resp.Header)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			// No usable answer: the upstream may still have counted the request.
-			ticket(r.Context()).Failed()
+			heldFor(r.Context()).t.Failed()
 			if r.Context().Err() == nil {
 				w.WriteHeader(http.StatusBadGateway)
 			}
@@ -56,8 +69,25 @@ func New(upstream *url.URL, cfg budget.Config) *Proxy {
 	return p
 }
 
-func ticket(ctx context.Context) *budget.Ticket {
-	return ctx.Value(ticketKey{}).(*budget.Ticket)
+func heldFor(ctx context.Context) held {
+	return ctx.Value(ticketKey{}).(held)
+}
+
+// classifyResource guesses which of GitHub's rate-limit resources a request
+// counts against, from its path. It is only a guess: the response's
+// x-ratelimit-resource header corrects the budget either way. Rare
+// resources (dependency_snapshots, audit_log, ...) fall under core.
+func classifyResource(path string) string {
+	switch {
+	case path == "/search/code":
+		return "code_search"
+	case path == "/search" || strings.HasPrefix(path, "/search/"):
+		return "search"
+	case path == "/graphql":
+		return "graphql"
+	default:
+		return "core"
+	}
 }
 
 func (p *Proxy) budgetFor(token string) *budget.Budget {
@@ -74,7 +104,8 @@ func (p *Proxy) budgetFor(token string) *budget.Budget {
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Like GitHub's points rule: GET, HEAD and OPTIONS are reads, the rest writes.
 	write := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
-	t, err := p.budgetFor(r.Header.Get("Authorization")).Acquire(r.Context(), write)
+	res := classifyResource(r.URL.Path)
+	t, err := p.budgetFor(r.Header.Get("Authorization")).Acquire(r.Context(), res, write)
 	var tooLong *budget.TooLongError
 	switch {
 	case errors.As(err, &tooLong):
@@ -87,5 +118,5 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		return // the client gave up while held
 	}
-	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ticketKey{}, t)))
+	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ticketKey{}, held{t, res})))
 }

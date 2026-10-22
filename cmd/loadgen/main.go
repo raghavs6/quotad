@@ -4,7 +4,9 @@
 //
 // Load is set as -demand: how many requests per window the fleet would send
 // if nothing were ever rejected, as a multiple of the budget. Below 1 there
-// is nothing to fix; the interesting runs are at 1 and above.
+// is nothing to fix; the interesting runs are at 1 and above. Searches,
+// which GitHub counts apart from core, are set the same way with
+// -search-demand, as a multiple of the search budget.
 package main
 
 import (
@@ -28,7 +30,8 @@ type Result struct {
 	Demand      float64         `json:"demand"`
 	Seed        uint64          `json:"seed"`
 	Server      fake.Stats      `json:"server"`
-	Utilization float64         `json:"utilization"` // successful requests ÷ budget, over windows that fit in the run
+	Utilization float64         `json:"utilization"` // successful core requests ÷ budget, over windows that fit in the run
+	SearchUtil  float64         `json:"search_utilization,omitempty"`
 	Agents      metrics.Summary `json:"agents"`
 }
 
@@ -45,6 +48,9 @@ func main() {
 	budget := flag.Int("budget", 500, "the server's budget per window (must match fakegithub)")
 	window := flag.Duration("window", 60*time.Second, "the server's window (must match fakegithub)")
 	latency := flag.Duration("latency", 100*time.Millisecond, "the server's service time (must match fakegithub)")
+	searchDemand := flag.Float64("search-demand", 0, "searches the fleet wants, as a multiple of the search budget (0 = none)")
+	searchBudget := flag.Int("search-budget", 0, "the server's search budget per search window (must match fakegithub; 0 = 30*budget/5000)")
+	searchWindow := flag.Duration("search-window", 0, "the server's search window (must match fakegithub; 0 = window/60)")
 	windows := flag.Int("windows", 3, "run length, in windows")
 	seed := flag.Uint64("seed", 1, "random seed")
 	asJSON := flag.Bool("json", false, "print one JSON line instead of a table")
@@ -58,11 +64,19 @@ func main() {
 		log.Fatalf("pollers (%d) can't exceed agents (%d)", *pollers, *nAgents)
 	}
 
+	if *searchBudget == 0 {
+		*searchBudget = max(1, 30**budget/5000)
+	}
+	if *searchWindow == 0 {
+		*searchWindow = *window / 60
+	}
+
 	// Turn demand into timing. Task calls run on a schedule, one every
-	// taskGap per agent. Polls are sequential, so one poll cycle is
-	// latency + pollEvery.
-	rate := *demand * float64(*budget) / window.Seconds() // requests per second
-	taskRate := rate * (1 - *bgShare)
+	// taskGap per agent. Searches are task calls too. Polls are
+	// sequential, so one poll cycle is latency + pollEvery.
+	rate := *demand * float64(*budget) / window.Seconds() // core requests per second
+	searchRate := *searchDemand * float64(*searchBudget) / searchWindow.Seconds()
+	taskRate := rate*(1-*bgShare) + searchRate
 	taskGap := time.Duration(float64(*nAgents) / taskRate * float64(time.Second))
 	pollEvery := time.Duration(0)
 	if *pollers > 0 {
@@ -75,6 +89,7 @@ func main() {
 	cfg := agents.Config{
 		BaseURL: *target, Token: *token, Strategy: strategy,
 		Agents: *nAgents, Pollers: *pollers, TaskGap: taskGap, PollEvery: pollEvery, WriteFrac: *writeFrac,
+		SearchFrac:  searchRate / taskRate,
 		BaseBackoff: time.Second, MaxBackoff: 32 * time.Second, Seed: *seed,
 	}
 
@@ -97,7 +112,10 @@ func main() {
 		log.Fatal(err)
 	}
 	res := Result{Strategy: strategy.String(), Demand: *demand, Seed: *seed, Server: server, Agents: rec.Summarize(end)}
-	res.Utilization = utilization(server, *budget, end)
+	res.Utilization = utilization(server.WindowResets, server.WindowOK, *budget, end)
+	if s := server.Search; s != nil {
+		res.SearchUtil = utilization(s.WindowResets, s.WindowOK, *searchBudget, end)
+	}
 
 	if *asJSON {
 		json.NewEncoder(os.Stdout).Encode(res)
@@ -113,6 +131,9 @@ func main() {
 	fmt.Printf("  critical wait       p50 %.2fs, p95 %.2fs (%d done, %d unfinished)\n",
 		a.CriticalP50, a.CriticalP95, a.CriticalDone, a.CriticalUnfinished)
 	fmt.Printf("  utilization         %.0f%% (%d ok, %d windows started)\n", 100*res.Utilization, server.OK, server.Windows)
+	if s := server.Search; s != nil {
+		fmt.Printf("  search              %d ok, %d 403s, %.0f%% utilization\n", s.OK, s.Primary403, 100*res.SearchUtil)
+	}
 	fmt.Printf("  rejections per sec  %v\n", a.RejectionsPerS)
 }
 
@@ -121,11 +142,11 @@ func main() {
 // after a reset, so they drift with traffic and the last one is often cut
 // off by the end of the run; counting it would charge a full window's
 // budget for a few seconds of traffic.
-func utilization(s fake.Stats, budget int, end time.Time) float64 {
+func utilization(resets []int64, oks []int, budget int, end time.Time) float64 {
 	ok, full := 0, 0
-	for i, reset := range s.WindowResets {
+	for i, reset := range resets {
 		if reset <= end.Unix() {
-			ok += s.WindowOK[i]
+			ok += oks[i]
 			full++
 		}
 	}

@@ -31,7 +31,7 @@ func roomyConfig() Config {
 
 // doRead sends one read and releases it right away.
 func doRead(l *Limiter) Decision {
-	d, release := l.Begin("tok", false)
+	d, release := l.Begin("tok", Core, false)
 	if release != nil {
 		release()
 	}
@@ -82,8 +82,8 @@ func TestRequestInsideRetryAfterIsViolation(t *testing.T) {
 	cfg.MaxConcurrent = 1
 	l, c := newTestLimiter(t, cfg)
 
-	_, release := l.Begin("tok", false) // hold the only slot
-	d, _ := l.Begin("tok", false)
+	_, release := l.Begin("tok", Core, false) // hold the only slot
+	d, _ := l.Begin("tok", Core, false)
 	if d.Status != http.StatusTooManyRequests || d.RetryAfter != 1 || d.Violation {
 		t.Fatalf("over concurrency: status %d retry-after %d violation %v; want 429, 1, false", d.Status, d.RetryAfter, d.Violation)
 	}
@@ -115,13 +115,13 @@ func TestEleventhConcurrentRequestRejected(t *testing.T) {
 
 	var releases []func()
 	for i := 1; i <= 10; i++ {
-		d, release := l.Begin("tok", false)
+		d, release := l.Begin("tok", Core, false)
 		if d.Status != http.StatusOK {
 			t.Fatalf("request %d: status %d, want 200", i, d.Status)
 		}
 		releases = append(releases, release)
 	}
-	if d, _ := l.Begin("tok", false); d.Status != http.StatusTooManyRequests {
+	if d, _ := l.Begin("tok", Core, false); d.Status != http.StatusTooManyRequests {
 		t.Fatalf("11th concurrent request: status %d, want 429", d.Status)
 	}
 	for _, r := range releases {
@@ -137,20 +137,20 @@ func TestWriteCostsFivePoints(t *testing.T) {
 
 	// 7 points: a write (5) and two reads (1 each) fit; a third read doesn't.
 	for i, write := range []bool{true, false, false} {
-		d, release := l.Begin("tok", write)
+		d, release := l.Begin("tok", Core, write)
 		if d.Status != http.StatusOK {
 			t.Fatalf("call %d: status %d, want 200", i, d.Status)
 		}
 		release()
 	}
-	d, _ := l.Begin("tok", false)
+	d, _ := l.Begin("tok", Core, false)
 	if d.Status != http.StatusTooManyRequests || d.RetryAfter != 1 {
 		t.Fatalf("over points: status %d retry-after %d; want 429, 1", d.Status, d.RetryAfter)
 	}
 
 	// After the points window and the retry-after, a write fits again.
 	c.advance(time.Second)
-	if d, _ := l.Begin("tok", true); d.Status != http.StatusOK {
+	if d, _ := l.Begin("tok", Core, true); d.Status != http.StatusOK {
 		t.Fatalf("next points window: status %d, want 200", d.Status)
 	}
 }
@@ -160,8 +160,52 @@ func TestTokensAreIndependent(t *testing.T) {
 	for range 6 {
 		doRead(l)
 	}
-	if d, _ := l.Begin("other", false); d.Status != http.StatusOK || d.Remaining != 4 {
+	if d, _ := l.Begin("other", Core, false); d.Status != http.StatusOK || d.Remaining != 4 {
 		t.Fatalf("other token: status %d remaining %d; want 200, 4", d.Status, d.Remaining)
+	}
+}
+
+func TestSearchHasItsOwnBudget(t *testing.T) {
+	cfg := roomyConfig()
+	cfg.SearchBudget, cfg.SearchWindow = 2, time.Second
+	l, c := newTestLimiter(t, cfg)
+	if l.Resource("/search/issues") != Search || l.Resource("/repos/o/r") != Core {
+		t.Fatal("paths under /search/ should be search, the rest core")
+	}
+
+	for i := range 2 {
+		if d, _ := l.Begin("tok", Search, false); d.Status != http.StatusOK || d.Resource != Search || d.Limit != 2 {
+			t.Fatalf("search %d: %+v, want 200 on search with limit 2", i, d)
+		}
+	}
+	if d, _ := l.Begin("tok", Search, false); d.Status != http.StatusForbidden || !d.Violation {
+		t.Fatalf("3rd search: %+v, want a 403 violation", d)
+	}
+	// Core is counted apart and still has its whole budget.
+	if d := doRead(l); d.Status != http.StatusOK || d.Remaining != 4 {
+		t.Fatalf("core while search is out: %+v, want 200 with 4 left", d)
+	}
+	c.advance(time.Second)
+	if d, _ := l.Begin("tok", Search, false); d.Status != http.StatusOK {
+		t.Fatalf("search after its reset: %+v, want 200", d)
+	}
+
+	st := l.Stats()["tok"]
+	if st.Requests != 5 || st.Violations != 1 || st.Search.Requests != 4 || st.Search.OK != 3 ||
+		st.Search.Primary403 != 1 || len(st.Search.WindowOK) != 2 || st.Windows != 1 {
+		t.Fatalf("stats = %+v, search = %+v", st, *st.Search)
+	}
+}
+
+func TestSecondaryLimitsAreSharedWithSearch(t *testing.T) {
+	cfg := roomyConfig()
+	cfg.MaxConcurrent = 1
+	cfg.SearchBudget, cfg.SearchWindow = 30, time.Second
+	l, _ := newTestLimiter(t, cfg)
+	_, release := l.Begin("tok", Core, false)
+	defer release()
+	if d, _ := l.Begin("tok", Search, false); d.Status != http.StatusTooManyRequests {
+		t.Fatalf("search while core holds the only slot: %+v, want 429", d)
 	}
 }
 
