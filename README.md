@@ -6,7 +6,7 @@ Agents point their API base URL at a small proxy on their machine. quotad reads 
 
 ## Status
 
-Early, not ready for production. The test bench is built. quotad keeps each key under GitHub's main budget and its secondary limits (requests in flight, points per minute), and it pauses every agent on a key after a 429. In the bench, no request reaches the upstream while it is limited. Priorities come next. See [PROJECT.md](PROJECT.md) for the plan, [docs/step1-baselines.md](docs/step1-baselines.md) for the baseline numbers, and [docs/step3-results.md](docs/step3-results.md) for the latest results.
+Early, not ready for production. The test bench is built. quotad keeps each key under GitHub's main budget and its secondary limits (requests in flight, points per minute), and it pauses every agent on a key after a 429. In the bench, no request reaches the upstream while it is limited. Priorities come next. See [PROJECT.md](PROJECT.md) for the plan, [docs/step1-baselines.md](docs/step1-baselines.md) for the baseline numbers, [docs/step3-results.md](docs/step3-results.md) for the latest bench results, and [docs/real-github-results.md](docs/real-github-results.md) for a first test against the real GitHub API.
 
 ## How it will work
 
@@ -54,6 +54,7 @@ bin/bench -proxy -parallel 8 > results/quotad.md
 | `cmd/quotad` | The proxy: `-upstream`, `-listen`, `-max-hold`, `-reset-guard`, and the secondary limits `-max-in-flight`, `-points`, `-points-window`, `-min-pause` (defaults are GitHub's numbers) |
 | `cmd/fakegithub` | Fake GitHub REST API with GitHub's primary and secondary limits, scaled by flags |
 | `cmd/loadgen` | Simulated agents sharing one token |
+| `cmd/realtest` | The same agents against the real GitHub API, directly or through quotad; counts every answer itself. `scripts/real-search-test.sh` runs the full real test |
 | `cmd/bench` | Runs every setting 5 times against fresh servers and reports ranges |
 | `internal/budget` | One token's limits: primary budget (reserve, then correct from headers), in-flight cap, points, shared pause; hold and release |
 | `internal/proxy` | quotad's HTTP layer around `httputil.ReverseProxy` |
