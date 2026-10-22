@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -163,5 +165,40 @@ func TestClassifyResource(t *testing.T) {
 		if got := classifyResource(path); got != want {
 			t.Errorf("classifyResource(%q) = %q, want %q", path, got, want)
 		}
+	}
+}
+
+func TestStatusPages(t *testing.T) {
+	p, l := setup(t, 10, budget.Config{MaxHold: time.Second})
+	get(t, p.URL)
+
+	resp, err := http.Get(p.URL + "/__quotad/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("health: got %d", resp.StatusCode)
+	}
+
+	resp, err = http.Get(p.URL + "/__quotad/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var s Stats
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Requests != 1 || s.Forwarded != 1 || len(s.Keys) != 1 {
+		t.Fatalf("got %+v", s)
+	}
+	k := s.Keys[0]
+	if k.Key == "" || strings.Contains(k.Key, "token") || len(k.Resources) != 1 || k.Resources[0].Name != "core" || k.Resources[0].Remaining != 9 {
+		t.Fatalf("got key %+v", k)
+	}
+	// Status pages are quotad's own: the upstream never sees them.
+	if got := l.Stats()["token t"].Requests; got != 1 {
+		t.Fatalf("upstream saw %d requests, want 1", got)
 	}
 }

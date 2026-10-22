@@ -2,18 +2,29 @@
 // base URL at it. It learns each token's primary budgets, one per resource
 // (core, search, ...), from the upstream's x-ratelimit-* headers, keeps each
 // token under the secondary limits, and holds requests until they fit.
+//
+// Every flag can also be set by an environment variable: QUOTAD_ plus the
+// flag name in capitals with - as _ (for example QUOTAD_MAX_HOLD=1m). A flag
+// on the command line wins over the variable.
 package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/raghavs6/quotad/internal/budget"
 	"github.com/raghavs6/quotad/internal/proxy"
 )
+
+// version is set at release build time with -ldflags "-X main.version=...".
+var version = "dev"
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8080", "listen address")
@@ -26,7 +37,19 @@ func main() {
 	points := flag.Int("points", budget.GitHubPoints, "secondary limit: points per -points-window, per token (read 1, write 5)")
 	pointsWindow := flag.Duration("points-window", budget.GitHubPointsEvery, "secondary limit: the points window")
 	minPause := flag.Duration("min-pause", budget.GitHubMinPause, "pause after a secondary-limit answer without retry-after; doubles while they repeat")
+	showVersion := flag.Bool("version", false, "print the version and exit")
+	if err := flagsFromEnv(flag.CommandLine, os.LookupEnv); err != nil {
+		log.Fatal(err)
+	}
 	flag.Parse()
+	// go install pkg@v0.1.0 builds record the module version instead.
+	if bi, ok := debug.ReadBuildInfo(); ok && version == "dev" && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		version = bi.Main.Version
+	}
+	if *showVersion {
+		fmt.Println("quotad", version)
+		return
+	}
 
 	upstream, err := url.Parse(*upstreamURL)
 	if err != nil {
@@ -37,7 +60,29 @@ func main() {
 		MaxInFlight: *maxInFlight, Points: *points, PointsWindow: *pointsWindow, MinPause: *minPause,
 	}
 	p := proxy.New(upstream, cfg)
-	log.Printf("quotad on %s -> %s (max hold %v, reset guard %v, %d in flight, %d points/%v, min pause %v)",
-		*listen, upstream, *maxHold, *resetGuard, *maxInFlight, *points, *pointsWindow, *minPause)
+	p.Version = version
+	log.Printf("quotad %s on %s -> %s (max hold %v, reset guard %v, %d in flight, %d points/%v, min pause %v)",
+		version, *listen, upstream, *maxHold, *resetGuard, *maxInFlight, *points, *pointsWindow, *minPause)
 	log.Fatal(http.ListenAndServe(*listen, p))
+}
+
+// envName is the environment variable for a flag: QUOTAD_MAX_HOLD for max-hold.
+func envName(flagName string) string {
+	return "QUOTAD_" + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+}
+
+// flagsFromEnv sets each flag in fs from its environment variable, if set.
+// Call it before fs.Parse, so the command line still wins.
+func flagsFromEnv(fs *flag.FlagSet, lookup func(string) (string, bool)) error {
+	var err error
+	fs.VisitAll(func(f *flag.Flag) {
+		v, ok := lookup(envName(f.Name))
+		if !ok || err != nil {
+			return
+		}
+		if e := f.Value.Set(v); e != nil {
+			err = fmt.Errorf("%s=%q: %v", envName(f.Name), v, e)
+		}
+	})
+	return err
 }
