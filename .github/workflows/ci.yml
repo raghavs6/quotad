@@ -11,6 +11,14 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A real Redis, so the budget tests also run with shared counts.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    env:
+      QUOTAD_TEST_REDIS: redis://localhost:6379/15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

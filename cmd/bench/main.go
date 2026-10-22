@@ -13,6 +13,10 @@
 // can stay under its budget while search runs out. Runs with searches also
 // print the critical calls' waits split by resource.
 //
+// With -proxies N, each run starts N quotad copies, like N machines, and
+// spreads the agents across them. Without -redis each copy counts alone;
+// with -redis they share one budget through it.
+//
 // Build the programs first: go build -o bin/ ./cmd/...
 package main
 
@@ -75,11 +79,16 @@ func main() {
 	viaProxy := flag.Bool("proxy", false, "put quotad between the agents and the fake server")
 	maxHold := flag.Duration("max-hold", 0, "quotad's max hold (0 = window/120, GitHub's 30s per hour scaled)")
 	searches := flag.Bool("searches", false, "agents also search, at the same demand multiple of the search budget")
+	nProxies := flag.Int("proxies", 1, "quotad copies per run, like machines (implies -proxy); agents are spread across them")
+	redisURL := flag.String("redis", "", "Redis URL the quotad copies share budgets through (implies -proxy); each run uses a fresh token")
 	searchDemands := flag.String("search-demands", "", "comma-separated search demand multiples, each run against every core demand (implies -searches)")
 	flag.Parse()
 
 	if *searchDemands != "" {
 		*searches = true
+	}
+	if *nProxies > 1 || *redisURL != "" {
+		*viaProxy = true
 	}
 	var settings []setting
 	for _, d := range parseList(*demands) {
@@ -117,7 +126,6 @@ func main() {
 		go func() {
 			defer wg.Done()
 			addr := fmt.Sprintf("127.0.0.1:%d", *port+slot)
-			proxyAddr := fmt.Sprintf("127.0.0.1:%d", *port+*parallel+slot)
 			for j := range jobs {
 				server := exec.Command(filepath.Join(*bin, "fakegithub"),
 					"-addr", addr, "-budget", strconv.Itoa(*budget), "-window", window.String(),
@@ -129,37 +137,53 @@ func main() {
 				}
 				waitForPort(addr)
 				target := "http://" + addr
-				var proxy *exec.Cmd
-				if *viaProxy {
+				var proxies []*exec.Cmd
+				var targets []string
+				for k := range *nProxies {
+					if !*viaProxy {
+						break
+					}
 					// Both programs share this machine's clock, so no reset
 					// guard. The secondary limits are the fake server's, as
 					// GitHub's published numbers would be in production.
-					proxy = exec.Command(filepath.Join(*bin, "quotad"),
-						"-listen", proxyAddr, "-upstream", target,
+					// Each copy is told the token's full limits, as each
+					// machine's would be.
+					proxyAddr := fmt.Sprintf("127.0.0.1:%d", *port+*parallel+slot**nProxies+k)
+					args := []string{"-listen", proxyAddr, "-upstream", target,
 						"-max-hold", hold.String(), "-reset-guard", "0",
 						"-max-in-flight", strconv.Itoa(*concurrency),
 						"-points", strconv.Itoa(max(5, 900**budget/5000)), "-points-window", minute.String(),
-						"-min-pause", minute.String())
+						"-min-pause", minute.String()}
+					if *redisURL != "" {
+						args = append(args, "-redis", *redisURL)
+					}
+					proxy := exec.Command(filepath.Join(*bin, "quotad"), args...)
 					proxy.Stderr = os.Stderr
 					if err := proxy.Start(); err != nil {
 						log.Fatal(err)
 					}
 					waitForPort(proxyAddr)
-					target = "http://" + proxyAddr
+					proxies = append(proxies, proxy)
+					targets = append(targets, "http://"+proxyAddr)
 				}
+				if len(targets) > 0 {
+					target = strings.Join(targets, ",")
+				}
+				// A fresh token per run, so nothing in Redis carries over.
+				token := fmt.Sprintf("bench-%d-%d", time.Now().UnixNano(), slot)
 
 				var stdout bytes.Buffer
 				lg := exec.Command(filepath.Join(*bin, "loadgen"), "-json",
 					"-search-demand", strconv.FormatFloat(j.searchDemand, 'g', -1, 64),
 					"-search-budget", strconv.Itoa(searchBudget), "-search-window", minute.String(),
-					"-target", target, "-stats", "http://"+addr+"/__stats", "-strategy", j.strategy,
+					"-target", target, "-stats", "http://"+addr+"/__stats", "-token", token, "-strategy", j.strategy,
 					"-demand", strconv.FormatFloat(j.demand, 'g', -1, 64),
 					"-budget", strconv.Itoa(*budget), "-window", window.String(), "-latency", latency.String(),
 					"-windows", strconv.Itoa(*windows), "-agents", strconv.Itoa(*nAgents),
 					"-pollers", strconv.Itoa(*pollers), "-seed", strconv.FormatUint(j.seed, 10))
 				lg.Stdout, lg.Stderr = &stdout, os.Stderr
 				err := lg.Run()
-				if proxy != nil {
+				for _, proxy := range proxies {
 					proxy.Process.Kill()
 					proxy.Wait()
 				}
@@ -213,6 +237,13 @@ func main() {
 			done, total, r.Strategy, r.Demand, r.SearchDemand, r.Seed, r.Server.Violations, r.Agents.CriticalP95)
 	}
 
+	if *nProxies > 1 {
+		shared := "each counting alone"
+		if *redisURL != "" {
+			shared = "sharing one budget through Redis"
+		}
+		fmt.Printf("%d quotad copies, %s, agents spread across them. ", *nProxies, shared)
+	}
 	if *viaProxy {
 		fmt.Printf("Through quotad (max hold %v, reset guard 0, %d in flight, %d points per %v). ", hold, *concurrency, max(5, 900**budget/5000), minute)
 	}

@@ -6,7 +6,7 @@ Agents point their API base URL at a small proxy on their machine. quotad reads 
 
 ## Status
 
-Early: good for trying out, not yet proven in production. The [Quickstart](#quickstart) gets it running. The test bench is built. quotad keeps each key under GitHub's main budgets and its secondary limits (requests in flight, points per minute), and it pauses every agent on a key after a 429. GitHub keeps a separate main budget per resource (core, search, code_search, graphql, ...), and so does quotad. In the bench, no request reaches the upstream while it is limited. Priorities come next. See [PROJECT.md](PROJECT.md) for the plan, [docs/step1-baselines.md](docs/step1-baselines.md) for the baseline numbers, [docs/step3-results.md](docs/step3-results.md) and [docs/per-resource-results.md](docs/per-resource-results.md) for the latest bench results, [docs/per-resource-waits.md](docs/per-resource-waits.md) for waits split by resource, and [docs/real-github-results.md](docs/real-github-results.md) for a first test against the real GitHub API.
+Early: good for trying out, not yet proven in production. The [Quickstart](#quickstart) gets it running. The test bench is built. quotad keeps each key under GitHub's main budgets and its secondary limits (requests in flight, points per minute), and it pauses every agent on a key after a 429. GitHub keeps a separate main budget per resource (core, search, code_search, graphql, ...), and so does quotad. In the bench, no request reaches the upstream while it is limited. With `-redis`, quotad copies on many machines share one budget per key through Redis. Priorities come next. See [PROJECT.md](PROJECT.md) for the plan, [docs/step1-baselines.md](docs/step1-baselines.md) for the baseline numbers, [docs/step3-results.md](docs/step3-results.md) and [docs/per-resource-results.md](docs/per-resource-results.md) for the latest bench results, [docs/per-resource-waits.md](docs/per-resource-waits.md) for waits split by resource, [docs/real-github-results.md](docs/real-github-results.md) for a first test against the real GitHub API, and [docs/redis-results.md](docs/redis-results.md) for many copies sharing one budget through Redis.
 
 ## Quickstart
 
@@ -83,12 +83,19 @@ Every flag can also be set by an environment variable: `QUOTAD_` plus the flag n
 | `-points` | `QUOTAD_POINTS` | `900` | Points per points window, per token (read 1, write 5) |
 | `-points-window` | `QUOTAD_POINTS_WINDOW` | `1m` | The points window |
 | `-min-pause` | `QUOTAD_MIN_PAUSE` | `1m` | Pause after a secondary-limit answer without `Retry-After` |
+| `-redis` | `QUOTAD_REDIS` | empty | Redis URL (`redis://host:6379/0`) to share budgets with other quotad copies. Empty keeps budgets in memory |
+| `-lease` | `QUOTAD_LEASE` | `2m` | With `-redis`: how long a call may go unanswered before it counts as failed, so a crashed copy's slots free up |
+| `-redis-timeout` | `QUOTAD_REDIS_TIMEOUT` | `100ms` | With `-redis`: longest wait for Redis before a copy counts alone for a moment |
 
 The secondary-limit defaults are GitHub's published numbers.
 
+### Many machines
+
+By default each quotad keeps its budgets in memory, so two machines that share a token do not see each other's use and together overspend. To share, run one Redis (any Redis works; for a try-out, `docker run -p 6379:6379 redis:7-alpine`) and start every quotad with the same `-redis redis://HOST:6379/0`. Tokens are never stored in Redis, only a hash.
+
 ### Limits today
 
-- Budgets live in memory. Each quotad process keeps its own, so two machines that share a token do not see each other's use. Shared budgets across machines (Redis) are planned, not built.
+- If Redis can't be reached, a copy counts alone with the full budget until Redis is back, so copies can overspend during the outage. Splitting the budget between copies (1/N each) is planned.
 - Budgets reset when quotad restarts. It learns them again from the next response's headers.
 - Priorities (`X-Governor-Priority`) are not built yet.
 
@@ -109,10 +116,14 @@ First upstream is GitHub REST. OpenAI and Anthropic come later.
 
 ## Development
 
-Requires Go.
+Requires Go. Redis is optional; it is only for sharing budgets across machines.
 
 ```sh
 go test -race ./...
+
+# Also run the budget tests against a real Redis (any Redis works; Docker is easiest):
+docker run --rm -d -p 6379:6379 redis:7-alpine
+QUOTAD_TEST_REDIS=redis://127.0.0.1:6379/15 go test -race ./...
 ```
 
 CI runs the same tests, `go vet`, and a Docker build on every pull request.
@@ -144,18 +155,22 @@ bin/bench -proxy -parallel 8 > results/quotad.md
 
 # Mixed traffic: agents also search, which GitHub counts apart from core.
 bin/bench -proxy -searches -parallel 8 > results/quotad-searches.md
+
+# Many machines: 3 quotad copies, each counting alone, then sharing through Redis.
+bin/bench -proxies 3 -parallel 6 > results/copies-alone.md
+bin/bench -proxies 3 -redis redis://127.0.0.1:6379/1 -parallel 6 > results/copies-redis.md
 ```
 
 `curl -i -H 'Authorization: token x' localhost:8081/repos/o/r` shows the `x-ratelimit-*` headers; `curl localhost:8081/__stats` shows violation counts.
 
 | Path | What |
 |---|---|
-| `cmd/quotad` | The proxy. Flags and variables are under [Settings](#settings); `/__quotad/health` and `/__quotad/stats` are its own pages |
+| `cmd/quotad` | The proxy. Flags and variables are under [Settings](#settings) (`-redis` shares budgets across copies); `/__quotad/health` and `/__quotad/stats` are its own pages |
 | `cmd/fakegithub` | Fake GitHub REST API with GitHub's primary and secondary limits, scaled by flags. `/search/...` has its own primary limit, like GitHub's search resource |
-| `cmd/loadgen` | Simulated agents sharing one token |
+| `cmd/loadgen` | Simulated agents sharing one token; `-target` takes several URLs to spread them across quotad copies |
 | `cmd/realtest` | The same agents against the real GitHub API, directly or through quotad; counts every answer itself. `scripts/real-search-test.sh` runs the full real test |
 | `cmd/bench` | Runs every setting 5 times against fresh servers and reports ranges |
-| `internal/budget` | One token's limits: a primary budget and line per resource (reserve, then correct from headers), and the token's in-flight cap, points, shared pause; hold and release |
+| `internal/budget` | One token's limits: a primary budget and line per resource (reserve, then correct from headers), and the token's in-flight cap, points, shared pause; hold and release. The counts live in memory, or in Redis (Lua scripts, leases) to share them across copies |
 | `internal/proxy` | quotad's HTTP layer around `httputil.ReverseProxy`; guesses each request's resource from its path |
 | `internal/fake` | The rate-limit rules |
 | `internal/agents` | Agent behavior and the two baseline strategies |

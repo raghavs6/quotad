@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,6 +52,8 @@ func ParseStrategy(s string) (Strategy, error) {
 
 // Config describes the fleet.
 type Config struct {
+	// BaseURL may list several URLs, comma-separated, such as one per
+	// quotad copy. Agent i uses the i-th, wrapping around.
 	BaseURL  string
 	Token    string
 	Strategy Strategy
@@ -76,8 +79,11 @@ type Config struct {
 // unfinished.
 func Run(ctx context.Context, cfg Config, client *http.Client, rec *metrics.Recorder) {
 	var wg sync.WaitGroup
+	bases := strings.Split(cfg.BaseURL, ",")
 	for i := range cfg.Agents {
-		a := &agent{cfg: cfg, client: client, rec: rec, remaining: -1}
+		acfg := cfg
+		acfg.BaseURL = bases[i%len(bases)]
+		a := &agent{cfg: acfg, client: client, rec: rec, remaining: -1}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

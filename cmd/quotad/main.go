@@ -3,6 +3,9 @@
 // (core, search, ...), from the upstream's x-ratelimit-* headers, keeps each
 // token under the secondary limits, and holds requests until they fit.
 //
+// With -redis, every quotad on the same Redis shares one budget per token,
+// so copies on many machines stay under the limits together.
+//
 // Every flag can also be set by an environment variable: QUOTAD_ plus the
 // flag name in capitals with - as _ (for example QUOTAD_MAX_HOLD=1m). A flag
 // on the command line wins over the variable.
@@ -21,6 +24,7 @@ import (
 
 	"github.com/raghavs6/quotad/internal/budget"
 	"github.com/raghavs6/quotad/internal/proxy"
+	"github.com/redis/go-redis/v9"
 )
 
 // version is set at release build time with -ldflags "-X main.version=...".
@@ -37,6 +41,9 @@ func main() {
 	points := flag.Int("points", budget.GitHubPoints, "secondary limit: points per -points-window, per token (read 1, write 5)")
 	pointsWindow := flag.Duration("points-window", budget.GitHubPointsEvery, "secondary limit: the points window")
 	minPause := flag.Duration("min-pause", budget.GitHubMinPause, "pause after a secondary-limit answer without retry-after; doubles while they repeat")
+	redisURL := flag.String("redis", "", "Redis URL (redis://host:6379/0) to share budgets with other quotad copies; empty keeps them in memory")
+	lease := flag.Duration("lease", budget.DefaultLease, "with -redis: how long a request may go unanswered before it counts as failed (frees a crashed copy's slots)")
+	redisTimeout := flag.Duration("redis-timeout", 100*time.Millisecond, "with -redis: longest wait for Redis before counting alone for a moment")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	if err := flagsFromEnv(flag.CommandLine, os.LookupEnv); err != nil {
 		log.Fatal(err)
@@ -58,8 +65,20 @@ func main() {
 	cfg := budget.Config{
 		MaxHold: *maxHold, ResetGuard: *resetGuard,
 		MaxInFlight: *maxInFlight, Points: *points, PointsWindow: *pointsWindow, MinPause: *minPause,
+		Lease: *lease,
 	}
-	p := proxy.New(upstream, cfg)
+	var rdb *redis.Client
+	if *redisURL != "" {
+		opt, err := redis.ParseURL(*redisURL)
+		if err != nil {
+			log.Fatal(err)
+		}
+		opt.DialTimeout, opt.ReadTimeout, opt.WriteTimeout = *redisTimeout, *redisTimeout, *redisTimeout
+		opt.MaxRetries = -1 // a slow Redis is a missing Redis: count alone, don't retry
+		rdb = redis.NewClient(opt)
+		log.Printf("quotad: sharing budgets through Redis at %s", opt.Addr)
+	}
+	p := proxy.New(upstream, cfg, rdb)
 	p.Version = version
 	log.Printf("quotad %s on %s -> %s (max hold %v, reset guard %v, %d in flight, %d points/%v, min pause %v)",
 		version, *listen, upstream, *maxHold, *resetGuard, *maxInFlight, *points, *pointsWindow, *minPause)
