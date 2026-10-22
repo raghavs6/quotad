@@ -1,6 +1,6 @@
 # Redis shared budgets (v0.2)
 
-Written 2026-10-22 for sign-off before any code. PR #6 (per-resource budgets) and PR #7 (waits split by resource) are merged, so this builds on `main`.
+Written 2026-10-22 for sign-off before any code. Raghav signed off on all four questions on 2026-10-22. Results: [redis-results.md](redis-results.md). PR #6 (per-resource budgets) and PR #7 (waits split by resource) are merged, so this builds on `main`.
 
 ## Goal
 

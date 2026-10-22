@@ -34,8 +34,8 @@ Agents need no code changes: they point their API base URL at the local proxy.
 | Language | Go, one module (`cmd/` programs, `internal/` packages) |
 | Where it runs | A proxy on each machine. Solo mode (in-memory, no Redis) by default |
 | Sharing a budget | **Reserve, then correct:** reserve the estimated cost before sending, correct from headers. GitHub: within a window `used` only goes up (take the max). LLMs (refilling buckets): headers may only lower our estimate |
-| Many machines | Redis. Concurrency leases in a sorted set with deadlines so a crashed agent's slot expires. Not needed for the hourly budget |
-| Redis down | Fall back to a local share (last known remaining ÷ number of proxies) |
+| Many machines | Redis (`-redis`). Every count (primary budgets, in flight, points, pause) lives in Redis and changes in one Lua script. Each request holds a lease with a deadline, so a crashed copy's slot ends. Needed for the hourly budget too: headers correct a copy only after it sends, so copies counting alone overspend (docs/redis-results.md) |
+| Redis down | Fall back to a local share (last known remaining ÷ number of proxies). Until that lands, a copy counts alone (full budget) and retries Redis every second |
 | Priorities | `X-Governor-Priority: critical`; background calls stop at 20% remaining |
 | No budget left | Hold up to 30s, release in priority order; longer waits get an immediate `429` with `Retry-After` |
 | Duplicate reads | Merge identical in-flight GETs per machine; use ETags (a GitHub `304` doesn't count against the primary limit) |
