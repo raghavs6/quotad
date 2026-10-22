@@ -8,7 +8,10 @@
 //
 // With -searches, the agents also search, at the same demand multiple of
 // the search budget (GitHub's 30 a minute, scaled like the rest). Search is
-// its own resource, so this tests mixed traffic on one token.
+// its own resource, so this tests mixed traffic on one token. With
+// -search-demands, the search multiple is set on its own instead, so core
+// can stay under its budget while search runs out. Runs with searches also
+// print the critical calls' waits split by resource.
 //
 // Build the programs first: go build -o bin/ ./cmd/...
 package main
@@ -34,10 +37,11 @@ import (
 
 // run is the part of loadgen's -json output the bench reads.
 type run struct {
-	Strategy string  `json:"strategy"`
-	Demand   float64 `json:"demand"`
-	Seed     uint64  `json:"seed"`
-	Server   struct {
+	Strategy     string  `json:"strategy"`
+	Demand       float64 `json:"demand"`
+	SearchDemand float64 `json:"search_demand"`
+	Seed         uint64  `json:"seed"`
+	Server       struct {
 		Violations   int `json:"violations"`
 		Primary403   int `json:"primary_403"`
 		Secondary429 int `json:"secondary_429"`
@@ -48,8 +52,9 @@ type run struct {
 }
 
 type setting struct {
-	strategy string
-	demand   float64
+	strategy     string
+	demand       float64
+	searchDemand float64
 }
 
 func main() {
@@ -70,16 +75,26 @@ func main() {
 	viaProxy := flag.Bool("proxy", false, "put quotad between the agents and the fake server")
 	maxHold := flag.Duration("max-hold", 0, "quotad's max hold (0 = window/120, GitHub's 30s per hour scaled)")
 	searches := flag.Bool("searches", false, "agents also search, at the same demand multiple of the search budget")
+	searchDemands := flag.String("search-demands", "", "comma-separated search demand multiples, each run against every core demand (implies -searches)")
 	flag.Parse()
 
+	if *searchDemands != "" {
+		*searches = true
+	}
 	var settings []setting
-	for _, d := range strings.Split(*demands, ",") {
-		demand, err := strconv.ParseFloat(strings.TrimSpace(d), 64)
-		if err != nil {
-			log.Fatalf("bad demand %q: %v", d, err)
+	for _, d := range parseList(*demands) {
+		// Without -search-demands, search runs at the core multiple (or 0).
+		sds := []float64{0}
+		if *searches {
+			sds = []float64{d}
 		}
-		for _, s := range strings.Split(*strategies, ",") {
-			settings = append(settings, setting{strings.TrimSpace(s), demand})
+		if *searchDemands != "" {
+			sds = parseList(*searchDemands)
+		}
+		for _, sd := range sds {
+			for _, s := range strings.Split(*strategies, ",") {
+				settings = append(settings, setting{strings.TrimSpace(s), d, sd})
+			}
 		}
 	}
 
@@ -133,13 +148,9 @@ func main() {
 					target = "http://" + proxyAddr
 				}
 
-				searchDemand := 0.0
-				if *searches {
-					searchDemand = j.demand
-				}
 				var stdout bytes.Buffer
 				lg := exec.Command(filepath.Join(*bin, "loadgen"), "-json",
-					"-search-demand", strconv.FormatFloat(searchDemand, 'g', -1, 64),
+					"-search-demand", strconv.FormatFloat(j.searchDemand, 'g', -1, 64),
 					"-search-budget", strconv.Itoa(searchBudget), "-search-window", minute.String(),
 					"-target", target, "-stats", "http://"+addr+"/__stats", "-strategy", j.strategy,
 					"-demand", strconv.FormatFloat(j.demand, 'g', -1, 64),
@@ -155,12 +166,13 @@ func main() {
 				server.Process.Kill()
 				server.Wait()
 				if err != nil {
-					log.Fatalf("loadgen %s %.2gx seed %d: %v", j.strategy, j.demand, j.seed, err)
+					log.Fatalf("loadgen %s %.2gx (search %.2gx) seed %d: %v", j.strategy, j.demand, j.searchDemand, j.seed, err)
 				}
 				var r run
 				if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
 					log.Fatalf("parsing loadgen output: %v", err)
 				}
+				r.SearchDemand = j.searchDemand // loadgen omits 0
 				results <- r
 			}
 		}()
@@ -191,13 +203,14 @@ func main() {
 	total := len(settings) * *runs
 	for r := range results {
 		json.NewEncoder(w).Encode(r)
-		bySetting[setting{r.Strategy, r.Demand}] = append(bySetting[setting{r.Strategy, r.Demand}], r)
+		key := setting{r.Strategy, r.Demand, r.SearchDemand}
+		bySetting[key] = append(bySetting[key], r)
 		done := 0
 		for _, rs := range bySetting {
 			done += len(rs)
 		}
-		log.Printf("%d/%d done: %s %.2gx seed %d: %d violations, critical p95 %.2fs",
-			done, total, r.Strategy, r.Demand, r.Seed, r.Server.Violations, r.Agents.CriticalP95)
+		log.Printf("%d/%d done: %s %.2gx (search %.2gx) seed %d: %d violations, critical p95 %.2fs",
+			done, total, r.Strategy, r.Demand, r.SearchDemand, r.Seed, r.Server.Violations, r.Agents.CriticalP95)
 	}
 
 	if *viaProxy {
@@ -207,24 +220,20 @@ func main() {
 		*nAgents, *pollers, *budget, *window, *concurrency, *latency, *windows, *runs)
 	searchCol, searchSep := "", ""
 	if *searches {
-		fmt.Printf("Agents also search: %d searches per %v, at the same demand multiple. Utilization is core's.\n\n", searchBudget, minute)
-		searchCol, searchSep = " search utilization |", "---|"
+		if *searchDemands == "" {
+			fmt.Printf("Agents also search: %d searches per %v, at the same demand multiple. Utilization is core's.\n\n", searchBudget, minute)
+		} else {
+			fmt.Printf("Agents also search: %d searches per %v, at the search demand shown. Utilization is core's.\n\n", searchBudget, minute)
+		}
+		searchCol, searchSep = " search demand | search utilization |", "---|---|"
 	}
 	fmt.Println("| demand | strategy | violations | 403s | 429s | peak rejections/s | rejections ≤2s after reset | critical p50 (s) | critical p95 (s) | unfinished critical | utilization |" + searchCol)
 	fmt.Println("|---|---|---|---|---|---|---|---|---|---|---|" + searchSep)
 	for _, s := range settings {
-		rs := bySetting[s]
-		col := func(f func(run) float64, format string) string {
-			xs := make([]float64, len(rs))
-			for i, r := range rs {
-				xs[i] = f(r)
-			}
-			g := metrics.RangeOf(xs)
-			return fmt.Sprintf(format+" ["+format+"–"+format+"]", g.Mean, g.Min, g.Max)
-		}
+		col := colFor(bySetting[s])
 		search := ""
 		if *searches {
-			search = " " + col(func(r run) float64 { return 100 * r.SearchUtil }, "%.0f%%") + " |"
+			search = fmt.Sprintf(" %.2gx | %s |", s.searchDemand, col(func(r run) float64 { return 100 * r.SearchUtil }, "%.0f%%"))
 		}
 		fmt.Printf("| %.2gx | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |%s\n", s.demand, s.strategy,
 			col(func(r run) float64 { return float64(r.Server.Violations) }, "%.0f"),
@@ -239,6 +248,57 @@ func main() {
 			search,
 		)
 	}
+	if *searches {
+		printByResource(settings, bySetting)
+	}
+}
+
+// colFor returns a function that formats one number across rs as
+// mean [min–max].
+func colFor(rs []run) func(f func(run) float64, format string) string {
+	return func(f func(run) float64, format string) string {
+		xs := make([]float64, len(rs))
+		for i, r := range rs {
+			xs[i] = f(r)
+		}
+		g := metrics.RangeOf(xs)
+		return fmt.Sprintf(format+" ["+format+"–"+format+"]", g.Mean, g.Min, g.Max)
+	}
+}
+
+// printByResource prints the critical calls' waits split by resource.
+func printByResource(settings []setting, bySetting map[setting][]run) {
+	fmt.Println("\nCritical calls by resource. Wait is from when the agent wanted the call; it includes time stuck behind the agent's own earlier calls. Call time is from when the agent first sent it: quotad's hold, rejections and retries, and the server's latency.")
+	fmt.Println()
+	fmt.Println("| demand | search demand | strategy | core wait p50 (s) | core wait p95 (s) | core call p95 (s) | unfinished core | search wait p95 (s) | search call p95 (s) | unfinished search |")
+	fmt.Println("|---|---|---|---|---|---|---|---|---|---|")
+	for _, s := range settings {
+		col := colFor(bySetting[s])
+		res := func(name string, f func(metrics.ResourceSummary) float64) func(run) float64 {
+			return func(r run) float64 { return f(r.Agents.Resources[name]) }
+		}
+		fmt.Printf("| %.2gx | %.2gx | %s | %s | %s | %s | %s | %s | %s | %s |\n", s.demand, s.searchDemand, s.strategy,
+			col(res("core", func(x metrics.ResourceSummary) float64 { return x.WaitP50 }), "%.2f"),
+			col(res("core", func(x metrics.ResourceSummary) float64 { return x.WaitP95 }), "%.2f"),
+			col(res("core", func(x metrics.ResourceSummary) float64 { return x.CallP95 }), "%.2f"),
+			col(res("core", func(x metrics.ResourceSummary) float64 { return float64(x.Unfinished) }), "%.0f"),
+			col(res("search", func(x metrics.ResourceSummary) float64 { return x.WaitP95 }), "%.2f"),
+			col(res("search", func(x metrics.ResourceSummary) float64 { return x.CallP95 }), "%.2f"),
+			col(res("search", func(x metrics.ResourceSummary) float64 { return float64(x.Unfinished) }), "%.0f"),
+		)
+	}
+}
+
+func parseList(list string) []float64 {
+	var xs []float64
+	for _, x := range strings.Split(list, ",") {
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			log.Fatalf("bad number %q: %v", x, err)
+		}
+		xs = append(xs, f)
+	}
+	return xs
 }
 
 // waitForPort blocks until something listens on addr.

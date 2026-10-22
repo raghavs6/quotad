@@ -33,7 +33,8 @@ type Recorder struct {
 }
 
 type call struct {
-	wanted, done time.Time // done is zero if the call never succeeded
+	resource           string    // "core" or "search": the budget the call spends
+	wanted, sent, done time.Time // sent is zero if the call was never sent, done if it never succeeded
 }
 
 // NewRecorder starts a recorder whose run began at start.
@@ -55,11 +56,13 @@ func (r *Recorder) Reset(unix int64) {
 	r.mu.Unlock()
 }
 
-// Critical records one critical call: when the agent wanted to send it and
-// when it succeeded. Pass a zero done for a call still unfinished at the end.
-func (r *Recorder) Critical(wanted, done time.Time) {
+// Critical records one critical call: which resource it spends, when the
+// agent wanted to send it, when the agent first sent it, and when it
+// succeeded. Pass a zero sent for a call the agent never got to send, and a
+// zero done for a call still unfinished at the end.
+func (r *Recorder) Critical(resource string, wanted, sent, done time.Time) {
 	r.mu.Lock()
-	r.waits = append(r.waits, call{wanted, done})
+	r.waits = append(r.waits, call{resource, wanted, sent, done})
 	r.mu.Unlock()
 }
 
@@ -73,6 +76,28 @@ type Summary struct {
 	PeakRejectionsPerS int     `json:"peak_rejections_per_s"`
 	PostResetShare     float64 `json:"post_reset_share"` // of rejections, the share within PostResetSpan after a reset
 	RejectionsPerS     []int   `json:"rejections_per_s"` // second i of the run
+
+	// The critical calls again, split by the resource they spend.
+	Resources map[string]ResourceSummary `json:"resources,omitempty"`
+}
+
+// ResourceSummary is the critical calls of one resource.
+//
+// Wait runs from when the agent wanted the call to when it succeeded, as
+// for all critical calls. It includes time the agent spent stuck on its
+// own earlier calls, which may be of another resource: an agent sends one
+// task call at a time. Call time runs from when the agent first sent the
+// call to when it succeeded. It is only what happened to this call: a hold
+// in quotad, rejections and retries, and the server's latency. A call in
+// flight at the end counts with a call time of end minus sent; a call never
+// sent has no call time.
+type ResourceSummary struct {
+	Done       int     `json:"done"`
+	Unfinished int     `json:"unfinished"`
+	WaitP50    float64 `json:"wait_p50_s"`
+	WaitP95    float64 `json:"wait_p95_s"`
+	CallP50    float64 `json:"call_p50_s"`
+	CallP95    float64 `json:"call_p95_s"`
 }
 
 // PostResetSpan is how soon after a reset a rejection counts as part of the
@@ -87,19 +112,49 @@ func (r *Recorder) Summarize(end time.Time) Summary {
 	defer r.mu.Unlock()
 
 	var s Summary
-	waits := make([]float64, 0, len(r.waits))
-	for _, c := range r.waits {
-		done := c.done
-		if done.IsZero() {
-			s.CriticalUnfinished++
-			done = end
-		} else {
-			s.CriticalDone++
-		}
-		waits = append(waits, done.Sub(c.wanted).Seconds())
+	type samples struct {
+		ResourceSummary
+		waits, calls []float64
 	}
-	s.CriticalP50 = Percentile(waits, 50)
-	s.CriticalP95 = Percentile(waits, 95)
+	all := &samples{}
+	byResource := map[string]*samples{}
+	for _, c := range r.waits {
+		// A call with no resource counts only in the totals.
+		res := &samples{}
+		if c.resource != "" {
+			if byResource[c.resource] == nil {
+				byResource[c.resource] = &samples{}
+			}
+			res = byResource[c.resource]
+		}
+		done := c.done
+		for _, x := range []*samples{all, res} {
+			if done.IsZero() {
+				x.Unfinished++
+			} else {
+				x.Done++
+			}
+		}
+		if done.IsZero() {
+			done = end
+		}
+		all.waits = append(all.waits, done.Sub(c.wanted).Seconds())
+		res.waits = append(res.waits, done.Sub(c.wanted).Seconds())
+		if !c.sent.IsZero() {
+			res.calls = append(res.calls, done.Sub(c.sent).Seconds())
+		}
+	}
+	s.CriticalDone, s.CriticalUnfinished = all.Done, all.Unfinished
+	s.CriticalP50 = Percentile(all.waits, 50)
+	s.CriticalP95 = Percentile(all.waits, 95)
+	if len(byResource) > 0 {
+		s.Resources = map[string]ResourceSummary{}
+	}
+	for name, x := range byResource {
+		x.WaitP50, x.WaitP95 = Percentile(x.waits, 50), Percentile(x.waits, 95)
+		x.CallP50, x.CallP95 = Percentile(x.calls, 50), Percentile(x.calls, 95)
+		s.Resources[name] = x.ResourceSummary
+	}
 
 	s.Rejections = len(r.rejected)
 	s.RejectionsPerS = make([]int, int(math.Ceil(end.Sub(r.start).Seconds())))
