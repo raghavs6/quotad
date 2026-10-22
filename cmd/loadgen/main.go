@@ -37,7 +37,7 @@ type Result struct {
 }
 
 func main() {
-	target := flag.String("target", "http://127.0.0.1:8081", "base URL of the API (fake server or proxy)")
+	target := flag.String("target", "http://127.0.0.1:8081", "base URL of the API (fake server or proxy); several, comma-separated, spread the agents across them")
 	statsURL := flag.String("stats", "", "URL of the fake server's /__stats (default: target + /__stats)")
 	token := flag.String("token", "shared", "the one token every agent uses")
 	strategyName := flag.String("strategy", "backoff", "retry strategy: backoff or header-aware")
