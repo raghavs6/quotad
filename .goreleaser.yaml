@@ -1,0 +1,27 @@
+# Release downloads for quotad. Run by .github/workflows/release.yml on a v* tag.
+# Check locally with: goreleaser release --snapshot --clean
+version: 2
+
+builds:
+  - id: quotad
+    main: ./cmd/quotad
+    binary: quotad
+    env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{.Version}}"]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
