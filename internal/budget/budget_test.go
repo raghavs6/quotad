@@ -59,6 +59,9 @@ func (c *fakeTime) advance(d time.Duration) {
 
 var t0 = time.Unix(1_800_000_000, 0)
 
+// core returns the budget's core resource, the one most tests use.
+func core(b *Budget) *resource { return b.resources["core"] }
+
 func newTest(maxHold time.Duration) (*Budget, *fakeTime) {
 	return newTestWith(Config{MaxHold: maxHold})
 }
@@ -94,7 +97,7 @@ func headers(limit, remaining int, reset time.Time) http.Header {
 func acquireAsync(ctx context.Context, b *Budget) chan result {
 	ch := make(chan result, 1)
 	go func() {
-		t, err := b.Acquire(ctx, false)
+		t, err := b.Acquire(ctx, "core", false)
 		ch <- result{t, err}
 	}()
 	return ch
@@ -111,7 +114,10 @@ func waitingCount(t *testing.T, b *Budget, n int) {
 	t.Helper()
 	for range 1000 {
 		b.mu.Lock()
-		got := len(b.waiting)
+		got := 0
+		for _, r := range b.resources {
+			got += len(r.waiting)
+		}
 		b.mu.Unlock()
 		if got == n {
 			return
@@ -143,7 +149,7 @@ func mustBeHeld(t *testing.T, ch chan result) {
 
 func TestLearnsFirst(t *testing.T) {
 	b, _ := newTest(30 * time.Second)
-	first, err := b.Acquire(context.Background(), false)
+	first, err := b.Acquire(context.Background(), "core", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,11 +165,11 @@ func TestLearnsFirst(t *testing.T) {
 
 func TestHoldsWhenReservationsUseUpRemaining(t *testing.T) {
 	b, _ := newTest(30 * time.Second)
-	probe, _ := b.Acquire(context.Background(), false)
+	probe, _ := b.Acquire(context.Background(), "core", false)
 	probe.Done(200, headers(10, 3, t0.Add(10*time.Second)))
 
 	for i := range 3 {
-		if _, err := b.Acquire(context.Background(), false); err != nil {
+		if _, err := b.Acquire(context.Background(), "core", false); err != nil {
 			t.Fatalf("request %d: %v", i, err)
 		}
 	}
@@ -175,28 +181,28 @@ func TestHoldsWhenReservationsUseUpRemaining(t *testing.T) {
 func TestStaleResponseCantRaiseCount(t *testing.T) {
 	b, _ := newTest(30 * time.Second)
 	reset := t0.Add(10 * time.Second)
-	probe, _ := b.Acquire(context.Background(), false)
+	probe, _ := b.Acquire(context.Background(), "core", false)
 	probe.Done(200, headers(10, 5, reset))
 
-	a, _ := b.Acquire(context.Background(), false)
-	c, _ := b.Acquire(context.Background(), false)
+	a, _ := b.Acquire(context.Background(), "core", false)
+	c, _ := b.Acquire(context.Background(), "core", false)
 	c.Done(200, headers(10, 2, reset)) // the newer answer arrives first
 	a.Done(200, headers(10, 4, reset)) // the older one arrives late
-	if b.remaining != 2 {
-		t.Fatalf("remaining = %d, want 2 (the lowest seen this window)", b.remaining)
+	if core(b).remaining != 2 {
+		t.Fatalf("remaining = %d, want 2 (the lowest seen this window)", core(b).remaining)
 	}
 
 	// A response from a new window replaces the count.
-	d, _ := b.Acquire(context.Background(), false)
+	d, _ := b.Acquire(context.Background(), "core", false)
 	d.Done(200, headers(10, 9, reset.Add(time.Minute)))
-	if b.remaining != 9 {
-		t.Fatalf("remaining = %d, want 9 (new window)", b.remaining)
+	if core(b).remaining != 9 {
+		t.Fatalf("remaining = %d, want 9 (new window)", core(b).remaining)
 	}
 }
 
 func TestResetReleasesHeldInOrderUpToLimit(t *testing.T) {
 	b, c := newTest(30 * time.Second)
-	probe, _ := b.Acquire(context.Background(), false)
+	probe, _ := b.Acquire(context.Background(), "core", false)
 	probe.Done(200, headers(2, 0, t0.Add(10*time.Second)))
 
 	var held []chan result
@@ -217,11 +223,11 @@ func TestResetReleasesHeldInOrderUpToLimit(t *testing.T) {
 
 func TestTooLongIsTurnedAwayAtOnce(t *testing.T) {
 	b, c := newTest(5 * time.Second)
-	probe, _ := b.Acquire(context.Background(), false)
+	probe, _ := b.Acquire(context.Background(), "core", false)
 	probe.Done(200, headers(10, 0, t0.Add(42*time.Second)))
 
 	c.advance(300 * time.Millisecond) // 41.7s to go rounds up to 42
-	_, err := b.Acquire(context.Background(), false)
+	_, err := b.Acquire(context.Background(), "core", false)
 	var tl *TooLongError
 	if !errors.As(err, &tl) || tl.RetryAfter != 42 {
 		t.Fatalf("err = %v, want TooLongError with RetryAfter 42", err)
@@ -233,7 +239,7 @@ func TestTooLongIsTurnedAwayAtOnce(t *testing.T) {
 
 func TestHeldPastMaxHoldIsTurnedAway(t *testing.T) {
 	b, c := newTest(5 * time.Second)
-	probe, _ := b.Acquire(context.Background(), false) // the probe never answers
+	probe, _ := b.Acquire(context.Background(), "core", false) // the probe never answers
 	held := acquireAsync(context.Background(), b)
 	waitingCount(t, b, 1)
 
@@ -246,7 +252,7 @@ func TestHeldPastMaxHoldIsTurnedAway(t *testing.T) {
 
 func TestClientGivingUpLeavesTheLine(t *testing.T) {
 	b, _ := newTest(30 * time.Second)
-	probe, _ := b.Acquire(context.Background(), false)
+	probe, _ := b.Acquire(context.Background(), "core", false)
 	probe.Done(200, headers(10, 0, t0.Add(10*time.Second)))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -258,26 +264,26 @@ func TestClientGivingUpLeavesTheLine(t *testing.T) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.waiting) != 0 || b.reserved != 0 {
-		t.Fatalf("waiting %d reserved %d, want 0 and 0", len(b.waiting), b.reserved)
+	if len(core(b).waiting) != 0 || core(b).reserved != 0 || b.inFlight != 0 {
+		t.Fatalf("waiting %d reserved %d in flight %d, want 0, 0 and 0", len(core(b).waiting), core(b).reserved, b.inFlight)
 	}
 }
 
 func TestFailedRequestStaysSpent(t *testing.T) {
 	b, _ := newTest(30 * time.Second)
-	probe, _ := b.Acquire(context.Background(), false)
+	probe, _ := b.Acquire(context.Background(), "core", false)
 	probe.Done(200, headers(10, 1, t0.Add(10*time.Second)))
 
-	tk, _ := b.Acquire(context.Background(), false)
+	tk, _ := b.Acquire(context.Background(), "core", false)
 	tk.Failed()
-	if b.remaining != 0 || b.reserved != 0 {
-		t.Fatalf("remaining %d reserved %d, want 0 and 0", b.remaining, b.reserved)
+	if core(b).remaining != 0 || core(b).reserved != 0 {
+		t.Fatalf("remaining %d reserved %d, want 0 and 0", core(b).remaining, core(b).reserved)
 	}
 }
 
 func TestFailedProbeLetsNextRequestLearn(t *testing.T) {
 	b, _ := newTest(30 * time.Second)
-	probe, _ := b.Acquire(context.Background(), false)
+	probe, _ := b.Acquire(context.Background(), "core", false)
 	held := acquireAsync(context.Background(), b)
 	waitingCount(t, b, 1)
 	probe.Failed()
@@ -288,13 +294,13 @@ func TestFailedProbeLetsNextRequestLearn(t *testing.T) {
 
 func TestResponseWithoutHeadersCountsAsFailed(t *testing.T) {
 	b, _ := newTest(30 * time.Second)
-	probe, _ := b.Acquire(context.Background(), false)
+	probe, _ := b.Acquire(context.Background(), "core", false)
 	probe.Done(200, headers(10, 2, t0.Add(10*time.Second)))
-	tk, _ := b.Acquire(context.Background(), false)
+	tk, _ := b.Acquire(context.Background(), "core", false)
 	tk.Done(200, http.Header{})
 	tk.Done(200, headers(10, 9, t0.Add(10*time.Second))) // a second call is ignored
-	if b.remaining != 1 || b.reserved != 0 {
-		t.Fatalf("remaining %d reserved %d, want 1 and 0", b.remaining, b.reserved)
+	if core(b).remaining != 1 || core(b).reserved != 0 {
+		t.Fatalf("remaining %d reserved %d, want 1 and 0", core(b).remaining, core(b).reserved)
 	}
 }
 
@@ -303,7 +309,7 @@ func TestResponseWithoutHeadersCountsAsFailed(t *testing.T) {
 func learned(t *testing.T, cfg Config) (*Budget, *fakeTime) {
 	t.Helper()
 	b, c := newTestWith(cfg)
-	probe, err := b.Acquire(context.Background(), false)
+	probe, err := b.Acquire(context.Background(), "core", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +320,7 @@ func learned(t *testing.T, cfg Config) (*Budget, *fakeTime) {
 func acquireWrite(ctx context.Context, b *Budget, write bool) chan result {
 	ch := make(chan result, 1)
 	go func() {
-		t, err := b.Acquire(ctx, write)
+		t, err := b.Acquire(ctx, "core", write)
 		ch <- result{t, err}
 	}()
 	return ch
@@ -322,8 +328,8 @@ func acquireWrite(ctx context.Context, b *Budget, write bool) chan result {
 
 func TestInFlightCap(t *testing.T) {
 	b, _ := learned(t, Config{MaxHold: 30 * time.Second, MaxInFlight: 2})
-	first, _ := b.Acquire(context.Background(), false)
-	if _, err := b.Acquire(context.Background(), false); err != nil {
+	first, _ := b.Acquire(context.Background(), "core", false)
+	if _, err := b.Acquire(context.Background(), "core", false); err != nil {
 		t.Fatal(err)
 	}
 	third := acquireAsync(context.Background(), b)
@@ -341,7 +347,7 @@ func TestPointsCap(t *testing.T) {
 	// write (5) and two reads (1 each) fit, and a third read doesn't.
 	b, c := learned(t, Config{MaxHold: 2 * time.Minute, Points: 8, PointsWindow: time.Minute})
 	for i, write := range []bool{true, false, false} {
-		if _, err := b.Acquire(context.Background(), write); err != nil {
+		if _, err := b.Acquire(context.Background(), "core", write); err != nil {
 			t.Fatalf("call %d: %v", i, err)
 		}
 	}
@@ -359,7 +365,7 @@ func TestPointsCap(t *testing.T) {
 func TestPointsCountUntilAWindowAfterTheAnswer(t *testing.T) {
 	b, c := learned(t, Config{MaxHold: 5 * time.Minute, Points: 6, PointsWindow: time.Minute})
 	c.advance(40 * time.Second)
-	w, err := b.Acquire(context.Background(), true) // 1 (probe) + 5 = 6 points
+	w, err := b.Acquire(context.Background(), "core", true) // 1 (probe) + 5 = 6 points
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +396,7 @@ func secondaryHeaders(retryAfter string) http.Header {
 
 func TestRetryAfterPausesEveryone(t *testing.T) {
 	b, c := learned(t, Config{MaxHold: 30 * time.Second})
-	tk, _ := b.Acquire(context.Background(), false)
+	tk, _ := b.Acquire(context.Background(), "core", false)
 	tk.Done(http.StatusTooManyRequests, secondaryHeaders("3"))
 
 	held := acquireAsync(context.Background(), b)
@@ -408,7 +414,7 @@ func TestPauseWithoutRetryAfterDoublesAndResets(t *testing.T) {
 
 	pauseFor := func(status int) time.Duration {
 		t.Helper()
-		tk, err := b.Acquire(context.Background(), false)
+		tk, err := b.Acquire(context.Background(), "core", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -437,10 +443,10 @@ func TestPauseWithoutRetryAfterDoublesAndResets(t *testing.T) {
 
 func TestPauseLongerThanMaxHoldIsTurnedAway(t *testing.T) {
 	b, _ := learned(t, Config{MaxHold: 5 * time.Second})
-	tk, _ := b.Acquire(context.Background(), false)
+	tk, _ := b.Acquire(context.Background(), "core", false)
 	tk.Done(http.StatusTooManyRequests, secondaryHeaders("30"))
 
-	_, err := b.Acquire(context.Background(), false)
+	_, err := b.Acquire(context.Background(), "core", false)
 	var tl *TooLongError
 	if !errors.As(err, &tl) || tl.RetryAfter != 30 {
 		t.Fatalf("err = %v, want TooLongError with RetryAfter 30", err)
@@ -451,7 +457,7 @@ func TestLineKeepsArrivalOrderAcrossChecks(t *testing.T) {
 	// One slot in flight. A write arrives first and a read second; when the
 	// slot frees, the write must go first even though points allow both.
 	b, _ := learned(t, Config{MaxHold: 30 * time.Second, MaxInFlight: 1})
-	busy, _ := b.Acquire(context.Background(), false)
+	busy, _ := b.Acquire(context.Background(), "core", false)
 	write := acquireWrite(context.Background(), b, true)
 	waitingCount(t, b, 1)
 	read := acquireWrite(context.Background(), b, false)
@@ -466,5 +472,157 @@ func TestLineKeepsArrivalOrderAcrossChecks(t *testing.T) {
 	w.t.Done(200, headers(5000, 4996, t0.Add(time.Hour)))
 	if r := mustGet(t, read); r.err != nil {
 		t.Fatalf("read: %v", r.err)
+	}
+}
+
+// Per-resource budgets: GitHub counts core, search, ... separately.
+
+func resHeaders(res string, limit, remaining int, reset time.Time) http.Header {
+	h := headers(limit, remaining, reset)
+	h.Set("x-ratelimit-resource", res)
+	return h
+}
+
+func acquireRes(ctx context.Context, b *Budget, res string, write bool) chan result {
+	ch := make(chan result, 1)
+	go func() {
+		t, err := b.Acquire(ctx, res, write)
+		ch <- result{t, err}
+	}()
+	return ch
+}
+
+// mixed returns a budget that knows core (plenty left) and search.
+func mixed(t *testing.T, cfg Config, searchLeft int) (*Budget, *fakeTime) {
+	t.Helper()
+	b, c := learned(t, cfg)
+	tk, err := b.Acquire(context.Background(), "search", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk.Done(200, resHeaders("search", 30, searchLeft, t0.Add(time.Minute)))
+	return b, c
+}
+
+func TestSearchAtZeroIsHeldAfterCore(t *testing.T) {
+	// Before per-resource budgets, core's later reset hid search's 0.
+	b, c := mixed(t, Config{MaxHold: 2 * time.Minute}, 0)
+	held := acquireRes(context.Background(), b, "search", false)
+	waitingCount(t, b, 1)
+	mustBeHeld(t, held)
+	c.advance(time.Minute)
+	if r := mustGet(t, held); r.err != nil {
+		t.Fatalf("search after its reset: %v", r.err)
+	}
+}
+
+func TestCoreGoesWhileSearchIsAtZero(t *testing.T) {
+	b, _ := mixed(t, Config{MaxHold: 2 * time.Minute}, 0)
+	search := acquireRes(context.Background(), b, "search", false)
+	waitingCount(t, b, 1)
+	// A core call arrives after the held search and goes at once.
+	if _, err := b.Acquire(context.Background(), "core", false); err != nil {
+		t.Fatalf("core call: %v", err)
+	}
+	mustBeHeld(t, search)
+}
+
+func TestEachResourceLearnsOnItsOwn(t *testing.T) {
+	b, _ := learned(t, Config{MaxHold: 30 * time.Second})
+	probe, err := b.Acquire(context.Background(), "search", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := acquireRes(context.Background(), b, "search", false)
+	waitingCount(t, b, 1)
+	mustBeHeld(t, second)
+	if _, err := b.Acquire(context.Background(), "core", false); err != nil {
+		t.Fatalf("core is known and should go: %v", err)
+	}
+	probe.Done(200, resHeaders("search", 30, 29, t0.Add(time.Minute)))
+	if r := mustGet(t, second); r.err != nil {
+		t.Fatalf("second search after the probe: %v", r.err)
+	}
+}
+
+func TestInFlightCapIsSharedAcrossResources(t *testing.T) {
+	b, _ := mixed(t, Config{MaxHold: 30 * time.Second, MaxInFlight: 2}, 29)
+	first, _ := b.Acquire(context.Background(), "core", false)
+	if _, err := b.Acquire(context.Background(), "search", false); err != nil {
+		t.Fatal(err)
+	}
+	third := acquireRes(context.Background(), b, "core", false)
+	waitingCount(t, b, 1)
+	mustBeHeld(t, third)
+	first.Done(200, resHeaders("core", 5000, 4990, t0.Add(time.Hour)))
+	if r := mustGet(t, third); r.err != nil {
+		t.Fatalf("third call after an answer: %v", r.err)
+	}
+}
+
+func TestSecondaryPauseOnSearchPausesCore(t *testing.T) {
+	b, c := mixed(t, Config{MaxHold: 30 * time.Second}, 29)
+	tk, _ := b.Acquire(context.Background(), "search", false)
+	h := resHeaders("search", 30, 28, t0.Add(time.Minute))
+	h.Set("retry-after", "3")
+	tk.Done(http.StatusTooManyRequests, h)
+
+	held := acquireRes(context.Background(), b, "core", false)
+	waitingCount(t, b, 1)
+	c.advance(2 * time.Second)
+	mustBeHeld(t, held)
+	c.advance(time.Second)
+	if r := mustGet(t, held); r.err != nil {
+		t.Fatalf("core after the pause: %v", r.err)
+	}
+}
+
+func TestOldestThatCanGoGoesFirstAcrossLines(t *testing.T) {
+	// One slot in flight. In line: a search (search at 0), then core A,
+	// then core B. When the slot frees, core A goes: the search can't, and
+	// A is older than B.
+	b, c := mixed(t, Config{MaxHold: 2 * time.Minute, MaxInFlight: 1}, 0)
+	busy, _ := b.Acquire(context.Background(), "core", false)
+	search := acquireRes(context.Background(), b, "search", false)
+	waitingCount(t, b, 1)
+	a := acquireRes(context.Background(), b, "core", false)
+	waitingCount(t, b, 2)
+	bb := acquireRes(context.Background(), b, "core", false)
+	waitingCount(t, b, 3)
+
+	busy.Done(200, resHeaders("core", 5000, 4990, t0.Add(time.Hour)))
+	ra := mustGet(t, a)
+	if ra.err != nil {
+		t.Fatalf("core A: %v", ra.err)
+	}
+	mustBeHeld(t, bb)
+	mustBeHeld(t, search)
+
+	// Core B goes next. At search's reset the search still waits for the
+	// slot, then goes when B answers.
+	ra.t.Done(200, resHeaders("core", 5000, 4989, t0.Add(time.Hour)))
+	r := mustGet(t, bb)
+	if r.err != nil {
+		t.Fatalf("core B: %v", r.err)
+	}
+	c.advance(time.Minute)
+	mustBeHeld(t, search) // the slot is B's
+	r.t.Done(200, resHeaders("core", 5000, 4988, t0.Add(time.Hour)))
+	if r := mustGet(t, search); r.err != nil {
+		t.Fatalf("search after its reset: %v", r.err)
+	}
+}
+
+func TestAnswerCorrectsTheResourceItNames(t *testing.T) {
+	b, _ := learned(t, Config{MaxHold: 30 * time.Second})
+	tk, _ := b.Acquire(context.Background(), "core", false) // guessed core
+	tk.Done(200, resHeaders("dependency_snapshots", 100, 0, t0.Add(time.Hour)))
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if core(b).remaining != 4999 || core(b).reserved != 0 {
+		t.Fatalf("core remaining %d reserved %d, want 4999 and 0", core(b).remaining, core(b).reserved)
+	}
+	if d := b.resources["dependency_snapshots"]; d == nil || !d.known || d.remaining != 0 {
+		t.Fatalf("dependency_snapshots = %+v, want known with 0 left", d)
 	}
 }

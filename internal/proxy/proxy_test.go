@@ -150,3 +150,18 @@ func TestSecondary429PausesTheToken(t *testing.T) {
 		t.Fatalf("second request reached the upstream %v after the 429, want at least 1s", gap)
 	}
 }
+
+func TestClassifyResource(t *testing.T) {
+	for path, want := range map[string]string{
+		"/search/code":         "code_search",
+		"/search/repositories": "search",
+		"/search/issues":       "search",
+		"/graphql":             "graphql",
+		"/repos/owner/repo":    "core",
+		"/searchx":             "core",
+	} {
+		if got := classifyResource(path); got != want {
+			t.Errorf("classifyResource(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
