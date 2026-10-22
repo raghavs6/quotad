@@ -261,3 +261,24 @@ func TestRedisUsesRedisClock(t *testing.T) {
 		t.Fatalf("err = %v, want ErrTooLong", err)
 	}
 }
+
+func TestRedisSnapshotShowsEveryCopysCounts(t *testing.T) {
+	a, b, c := twoCopies(t, Config{}, 4)
+	if _, err := b.Acquire(context.Background(), "core", true); err != nil {
+		t.Fatal(err)
+	}
+	s := a.Snapshot()
+	// The probe (1 point, answered) and b's write (5 points, in flight).
+	if s.InFlight != 1 || s.Points != 6 || len(s.Resources) != 1 {
+		t.Fatalf("snapshot = %+v, want 1 in flight, 6 points, one resource", s)
+	}
+	r := s.Resources[0]
+	if r.Name != "core" || !r.Known || r.Limit != 5000 || r.Remaining != 4 || r.Reserved != 1 || r.Reset == nil || !r.Reset.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("core = %+v, want known, 5000, 4 left, 1 reserved, reset in an hour", r)
+	}
+	// A window later, the probe's point has left it.
+	c.advance(time.Minute)
+	if s := a.Snapshot(); s.Points != 5 {
+		t.Fatalf("points a window later = %d, want 5", s.Points)
+	}
+}

@@ -27,6 +27,7 @@ import (
 //	              the lease runs out (ms)
 //	P:pts         sorted set of answered requests' points, "id|cost",
 //	              scored by when they were answered (ms)
+//	P:names       set of the token's resource names, for the stats page
 //
 // A lease is how a crashed copy's reservations end: if no answer comes
 // before it runs out, admit counts the request as failed.
@@ -277,12 +278,13 @@ end
 
 redis.call('HSET', st, 'ptotal', ptotal)
 for name, r in pairs(res) do
+  redis.call('SADD', P .. ':names', name)
   local k = P .. ':r:' .. name
   redis.call('HSET', k, 'known', r.known and 1 or 0, 'probing', r.probing, 'limit', r.limit,
     'remaining', r.remaining, 'reset', r.reset, 'reserved', r.reserved)
   redis.call('PEXPIRE', k, ttl)
 end
-for _, k in ipairs({st, fly, pts}) do redis.call('PEXPIRE', k, ttl) end
+for _, k in ipairs({st, fly, pts, P .. ':names'}) do redis.call('PEXPIRE', k, ttl) end
 
 local reply = {0}
 if wake ~= 0 then reply[1] = wake - now end
@@ -364,4 +366,54 @@ if redis.call('ZREM', fly, m) == 1 then
   if v[1] ~= '1' and v[2] == id then redis.call('HSET', rk, 'probing', '') end
 end
 return 1
+`)
+
+func (rc *redisCounts) snapshot() Snapshot {
+	if time.Now().Before(rc.downUntil) {
+		return rc.mem.snapshot()
+	}
+	v, err := snapshotScript.Run(context.Background(), rc.rdb, []string{rc.key}, rc.nowArg(), rc.cfg.PointsWindow.Milliseconds()).Slice()
+	if err == nil && (len(v) < 4 || (len(v)-4)%6 != 0) {
+		err = fmt.Errorf("snapshot: bad reply %v", v)
+	}
+	if !rc.ok(err) {
+		return rc.mem.snapshot()
+	}
+	n := func(x any) int64 { i, _ := x.(int64); return i }
+	s := Snapshot{InFlight: int(n(v[0])), Points: int(n(v[1])), Resources: []ResourceSnapshot{}}
+	if paused := n(v[2]); paused > n(v[3]) {
+		t := time.UnixMilli(paused)
+		s.PausedUntil = &t
+	}
+	for f := v[4:]; len(f) >= 6; f = f[6:] {
+		name, _ := f[0].(string)
+		rs := ResourceSnapshot{Name: name, Known: n(f[1]) == 1, Limit: int(n(f[2])), Remaining: int(n(f[3])), Reserved: int(n(f[5]))}
+		if reset := n(f[4]); reset != 0 {
+			t := time.Unix(reset, 0)
+			rs.Reset = &t
+		}
+		s.Resources = append(s.Resources, rs)
+	}
+	return s
+}
+
+// snapshotScript reads the counts without changing them. ARGV: now, points
+// window (ms). It returns in flight, points in the window, paused until,
+// now, then six fields per resource: name, known, limit, remaining, reset,
+// reserved.
+var snapshotScript = redis.NewScript(luaNow + `
+local win = tonumber(ARGV[2])
+local inflight = redis.call('ZRANGE', fly, 0, -1)
+local points = 0
+for _, m in ipairs(inflight) do points = points + tonumber(string.match(m, '|(%d+)$')) end
+for _, m in ipairs(redis.call('ZRANGEBYSCORE', pts, string.format('(%.0f', now - win), '+inf')) do
+  points = points + tonumber(string.match(m, '|(%d+)$'))
+end
+local reply = {#inflight, points, tonumber(redis.call('HGET', st, 'paused')) or 0, now}
+for _, name in ipairs(redis.call('SMEMBERS', P .. ':names')) do
+  local v = redis.call('HMGET', P .. ':r:' .. name, 'known', 'limit', 'remaining', 'reset', 'reserved')
+  reply[#reply + 1] = name
+  for j = 1, 5 do reply[#reply + 1] = tonumber(v[j]) or 0 end
+end
+return reply
 `)

@@ -127,6 +127,8 @@ type counts interface {
 	answer(l lease, a answer)
 	// cancel releases l for a request that was never sent.
 	cancel(l lease)
+	// snapshot reads the counts for the stats page, without changing them.
+	snapshot() Snapshot
 }
 
 // want is one held request, as counts sees it.

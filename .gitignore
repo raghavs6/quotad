@@ -4,3 +4,4 @@ UPDATES.md
 # Build output and raw bench runs
 bin/
 results/
+dist/

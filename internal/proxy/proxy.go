@@ -26,6 +26,11 @@ type Proxy struct {
 	schedule func(time.Duration, func())
 	rdb      *redis.Client // nil: budgets live in this process
 	rp       *httputil.ReverseProxy
+	upstream *url.URL
+	n        counters
+
+	// Version is shown on the health and stats pages.
+	Version string
 
 	mu      sync.Mutex
 	budgets map[string]*budget.Budget // keyed by the Authorization header
@@ -47,7 +52,7 @@ func New(upstream *url.URL, cfg budget.Config, rdb *redis.Client) *Proxy {
 	if rdb != nil && cfg.Lease == 0 {
 		cfg.Lease = budget.DefaultLease
 	}
-	p := &Proxy{cfg: cfg, now: time.Now, schedule: budget.AfterFunc, rdb: rdb, budgets: map[string]*budget.Budget{}}
+	p := &Proxy{cfg: cfg, now: time.Now, schedule: budget.AfterFunc, rdb: rdb, budgets: map[string]*budget.Budget{}, upstream: upstream, Version: "dev"}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(upstream)
@@ -113,6 +118,11 @@ func (p *Proxy) budgetFor(token string) *budget.Budget {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, StatusPrefix) {
+		p.serveStatus(w, r)
+		return
+	}
+	p.n.requests.Add(1)
 	// Like GitHub's points rule: GET, HEAD and OPTIONS are reads, the rest writes.
 	write := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
 	res := classifyResource(r.URL.Path)
@@ -120,6 +130,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var tooLong *budget.TooLongError
 	switch {
 	case errors.As(err, &tooLong):
+		p.n.turnedAway.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Retry-After", strconv.Itoa(tooLong.RetryAfter))
 		w.Header().Set("X-Quotad", "budget-exhausted")
@@ -127,8 +138,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"message":"quotad: rate-limit budget exhausted; retry later"}` + "\n"))
 		return
 	case err != nil:
+		p.n.gaveUp.Add(1)
 		return // the client gave up while held
 	}
+	p.n.forwarded.Add(1)
 	ctx := r.Context()
 	if p.rdb != nil {
 		// End the request before its lease does, so another copy never
