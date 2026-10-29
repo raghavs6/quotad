@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/raghavs6/quotad/internal/budget"
+	"github.com/redis/go-redis/v9"
 )
 
 // Proxy forwards to one upstream, with one budget per token.
@@ -23,6 +24,7 @@ type Proxy struct {
 	cfg      budget.Config
 	now      func() time.Time
 	schedule func(time.Duration, func())
+	rdb      *redis.Client // nil: budgets live in this process
 	rp       *httputil.ReverseProxy
 	upstream *url.URL
 	n        counters
@@ -43,9 +45,14 @@ type held struct {
 	res string
 }
 
-// New returns a proxy to upstream.
-func New(upstream *url.URL, cfg budget.Config) *Proxy {
-	p := &Proxy{cfg: cfg, now: time.Now, schedule: budget.AfterFunc, budgets: map[string]*budget.Budget{}, upstream: upstream, Version: "dev"}
+// New returns a proxy to upstream. With rdb nil, each token's budget lives
+// in this process. Otherwise it lives in Redis, shared with every quotad
+// that uses the same Redis.
+func New(upstream *url.URL, cfg budget.Config, rdb *redis.Client) *Proxy {
+	if rdb != nil && cfg.Lease == 0 {
+		cfg.Lease = budget.DefaultLease
+	}
+	p := &Proxy{cfg: cfg, now: time.Now, schedule: budget.AfterFunc, rdb: rdb, budgets: map[string]*budget.Budget{}, upstream: upstream, Version: "dev"}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(upstream)
@@ -100,7 +107,11 @@ func (p *Proxy) budgetFor(token string) *budget.Budget {
 	defer p.mu.Unlock()
 	b := p.budgets[token]
 	if b == nil {
-		b = budget.New(p.cfg, p.now, p.schedule)
+		if p.rdb != nil {
+			b = budget.NewRedis(p.cfg, p.rdb, token, p.schedule)
+		} else {
+			b = budget.New(p.cfg, p.now, p.schedule)
+		}
 		p.budgets[token] = b
 	}
 	return b
@@ -131,5 +142,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return // the client gave up while held
 	}
 	p.n.forwarded.Add(1)
-	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ticketKey{}, held{t, res})))
+	ctx := r.Context()
+	if p.rdb != nil {
+		// End the request before its lease does, so another copy never
+		// counts it as failed while it may still be running. The lease
+		// started a moment earlier, by Redis's clock, hence the margin.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.cfg.Lease*9/10)
+		defer cancel()
+	}
+	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(ctx, ticketKey{}, held{t, res})))
 }

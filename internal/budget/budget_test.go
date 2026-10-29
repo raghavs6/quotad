@@ -59,8 +59,31 @@ func (c *fakeTime) advance(d time.Duration) {
 
 var t0 = time.Unix(1_800_000_000, 0)
 
-// core returns the budget's core resource, the one most tests use.
-func core(b *Budget) *resource { return b.resources["core"] }
+// snap is what a test can see of one resource and of the token's shared
+// limits, from whichever counts the budget keeps.
+type snap struct {
+	known                         bool
+	remaining, reserved, inFlight int
+	paused                        time.Time
+}
+
+func state(t *testing.T, b *Budget, res string) snap {
+	t.Helper()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch c := b.c.(type) {
+	case *memory:
+		s := snap{inFlight: c.inFlight, paused: c.paused}
+		if r := c.resources[res]; r != nil {
+			s.known, s.remaining, s.reserved = r.known, r.remaining, r.reserved
+		}
+		return s
+	case *redisCounts:
+		return redisState(t, c, res)
+	}
+	t.Fatalf("no state for %T", b.c)
+	return snap{}
+}
 
 func newTest(maxHold time.Duration) (*Budget, *fakeTime) {
 	return newTestWith(Config{MaxHold: maxHold})
@@ -81,6 +104,9 @@ func newTestWith(cfg Config) (*Budget, *fakeTime) {
 	}
 	if cfg.MinPause == 0 {
 		cfg.MinPause = time.Minute
+	}
+	if testRedis != nil {
+		return newRedisTest(cfg, c, randomToken()), c
 	}
 	return New(cfg, c.now, c.schedule), c
 }
@@ -115,8 +141,8 @@ func waitingCount(t *testing.T, b *Budget, n int) {
 	for range 1000 {
 		b.mu.Lock()
 		got := 0
-		for _, r := range b.resources {
-			got += len(r.waiting)
+		for _, line := range b.lines {
+			got += len(line)
 		}
 		b.mu.Unlock()
 		if got == n {
@@ -188,15 +214,15 @@ func TestStaleResponseCantRaiseCount(t *testing.T) {
 	c, _ := b.Acquire(context.Background(), "core", false)
 	c.Done(200, headers(10, 2, reset)) // the newer answer arrives first
 	a.Done(200, headers(10, 4, reset)) // the older one arrives late
-	if core(b).remaining != 2 {
-		t.Fatalf("remaining = %d, want 2 (the lowest seen this window)", core(b).remaining)
+	if s := state(t, b, "core"); s.remaining != 2 {
+		t.Fatalf("remaining = %d, want 2 (the lowest seen this window)", s.remaining)
 	}
 
 	// A response from a new window replaces the count.
 	d, _ := b.Acquire(context.Background(), "core", false)
 	d.Done(200, headers(10, 9, reset.Add(time.Minute)))
-	if core(b).remaining != 9 {
-		t.Fatalf("remaining = %d, want 9 (new window)", core(b).remaining)
+	if s := state(t, b, "core"); s.remaining != 9 {
+		t.Fatalf("remaining = %d, want 9 (new window)", s.remaining)
 	}
 }
 
@@ -262,10 +288,9 @@ func TestClientGivingUpLeavesTheLine(t *testing.T) {
 	if r := mustGet(t, held); !errors.Is(r.err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", r.err)
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(core(b).waiting) != 0 || core(b).reserved != 0 || b.inFlight != 0 {
-		t.Fatalf("waiting %d reserved %d in flight %d, want 0, 0 and 0", len(core(b).waiting), core(b).reserved, b.inFlight)
+	waitingCount(t, b, 0)
+	if s := state(t, b, "core"); s.reserved != 0 || s.inFlight != 0 {
+		t.Fatalf("reserved %d in flight %d, want 0 and 0", s.reserved, s.inFlight)
 	}
 }
 
@@ -276,8 +301,8 @@ func TestFailedRequestStaysSpent(t *testing.T) {
 
 	tk, _ := b.Acquire(context.Background(), "core", false)
 	tk.Failed()
-	if core(b).remaining != 0 || core(b).reserved != 0 {
-		t.Fatalf("remaining %d reserved %d, want 0 and 0", core(b).remaining, core(b).reserved)
+	if s := state(t, b, "core"); s.remaining != 0 || s.reserved != 0 {
+		t.Fatalf("remaining %d reserved %d, want 0 and 0", s.remaining, s.reserved)
 	}
 }
 
@@ -299,8 +324,8 @@ func TestResponseWithoutHeadersCountsAsFailed(t *testing.T) {
 	tk, _ := b.Acquire(context.Background(), "core", false)
 	tk.Done(200, http.Header{})
 	tk.Done(200, headers(10, 9, t0.Add(10*time.Second))) // a second call is ignored
-	if core(b).remaining != 1 || core(b).reserved != 0 {
-		t.Fatalf("remaining %d reserved %d, want 1 and 0", core(b).remaining, core(b).reserved)
+	if s := state(t, b, "core"); s.remaining != 1 || s.reserved != 0 {
+		t.Fatalf("remaining %d reserved %d, want 1 and 0", s.remaining, s.reserved)
 	}
 }
 
@@ -419,9 +444,7 @@ func TestPauseWithoutRetryAfterDoublesAndResets(t *testing.T) {
 			t.Fatal(err)
 		}
 		tk.Done(status, secondaryHeaders(""))
-		b.mu.Lock()
-		d := b.paused.Sub(c.now())
-		b.mu.Unlock()
+		d := state(t, b, "core").paused.Sub(c.now())
 		c.advance(max(d, 0))
 		return d
 	}
@@ -617,12 +640,10 @@ func TestAnswerCorrectsTheResourceItNames(t *testing.T) {
 	b, _ := learned(t, Config{MaxHold: 30 * time.Second})
 	tk, _ := b.Acquire(context.Background(), "core", false) // guessed core
 	tk.Done(200, resHeaders("dependency_snapshots", 100, 0, t0.Add(time.Hour)))
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if core(b).remaining != 4999 || core(b).reserved != 0 {
-		t.Fatalf("core remaining %d reserved %d, want 4999 and 0", core(b).remaining, core(b).reserved)
+	if s := state(t, b, "core"); s.remaining != 4999 || s.reserved != 0 {
+		t.Fatalf("core remaining %d reserved %d, want 4999 and 0", s.remaining, s.reserved)
 	}
-	if d := b.resources["dependency_snapshots"]; d == nil || !d.known || d.remaining != 0 {
+	if d := state(t, b, "dependency_snapshots"); !d.known || d.remaining != 0 {
 		t.Fatalf("dependency_snapshots = %+v, want known with 0 left", d)
 	}
 }

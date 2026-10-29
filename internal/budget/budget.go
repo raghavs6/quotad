@@ -31,6 +31,7 @@
 package budget
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"math"
@@ -60,6 +61,11 @@ type Config struct {
 	// no retry-after (GitHub: at least a minute). Each further such answer
 	// in a row doubles it.
 	MinPause time.Duration
+
+	// Lease is how long a request admitted through Redis may go unanswered
+	// before it counts as failed, so a crashed copy's reservations end.
+	// Only NewRedis uses it.
+	Lease time.Duration
 }
 
 // Point costs, from GitHub's secondary-limit rules.
@@ -83,54 +89,79 @@ var ErrTooLong = &TooLongError{}
 func (e *TooLongError) Is(target error) bool { return target == ErrTooLong }
 
 // Budget is one token's budget. It is safe for concurrent use.
+//
+// Budget holds requests in lines, one per resource, and asks its counts
+// which of them may go. The counts live in this process (New) or in Redis,
+// shared by every quotad copy on the token (NewRedis).
 type Budget struct {
 	cfg      Config
 	now      func() time.Time
 	schedule func(time.Duration, func()) // runs f after d; time.AfterFunc in production
+	c        counts                      // used only with mu held
 
-	mu        sync.Mutex
-	resources map[string]*resource
-	inFlight  int       // admitted requests not yet answered, across all resources
-	arrivals  uint64    // counts requests as they arrive, to order the lines
-	timerAt   time.Time // when the pending wake-up timer fires, to avoid duplicates
-
-	spent  []*spend  // points of requests in flight or answered within the last PointsWindow
-	paused time.Time // no request goes out before this (after a secondary-limit answer)
-	streak int       // secondary-limit answers in a row without retry-after
-}
-
-// resource is one primary budget on the token, with its own line.
-type resource struct {
-	known     bool      // we have seen at least one response's headers
-	probing   bool      // the one request sent to learn the budget is in flight
-	limit     int       // x-ratelimit-limit
-	remaining int       // x-ratelimit-remaining, lowest seen this window
-	reset     time.Time // x-ratelimit-reset; zero after we roll into a window we haven't seen yet
-	reserved  int       // admitted requests not yet answered
-	waiting   []*waiter // held requests, oldest first
-}
-
-// spend is one request's points. They count from when it is sent until
-// PointsWindow after its answer. The upstream counted it at some moment in
-// between, and we can't know when, so the answer time is the safe end.
-type spend struct {
-	cost     int
-	answered time.Time // zero while in flight
-}
-
-// close marks the request answered (or abandoned) now.
-func (s *spend) close(now time.Time) {
-	if s.answered.IsZero() {
-		s.answered = now
-	}
+	mu       sync.Mutex
+	lines    map[string][]*waiter // held requests per resource, oldest first
+	arrivals uint64               // counts requests as they arrive, to order the lines
+	timerAt  time.Time            // when the pending wake-up timer fires, to avoid duplicates
 }
 
 type waiter struct {
 	arrival  uint64
+	res      string
 	cost     int
-	sp       *spend     // set when admitted
+	l        lease      // set when admitted
 	deadline time.Time  // arrival + MaxHold
 	done     chan error // nil error = admitted
+}
+
+// counts keeps one token's limits and decides which requests may go. Budget
+// calls its methods with its lock held, one at a time.
+type counts interface {
+	// admit goes through wants, oldest first, and admits each one that the
+	// limits allow. A want whose resource's primary budget is out is skipped,
+	// and so is every later want on that resource. The first want that the
+	// token's shared limits stop also stops every later want, so nobody
+	// jumps ahead of it.
+	admit(wants []want) grant
+	// answer applies the upstream's answer to l and releases l.
+	answer(l lease, a answer)
+	// cancel releases l for a request that was never sent.
+	cancel(l lease)
+	// snapshot reads the counts for the stats page, without changing them.
+	snapshot() Snapshot
+}
+
+// want is one held request, as counts sees it.
+type want struct {
+	res  string
+	cost int
+}
+
+// lease is one admitted request's reservation, in the form its counts uses.
+type lease any
+
+// grant is admit's result.
+type grant struct {
+	leases []lease // one per want; nil if not admitted
+	// release says, for each resource with a want left over, how long until
+	// the known part of its wait ends: the primary reset if its budget is
+	// out, or the end of a pause. Zero or less means no known wait.
+	release map[string]time.Duration
+	// wake is when to call admit again for the wants left over, if nothing
+	// local happens first. Zero means only a local answer can help.
+	wake time.Duration
+}
+
+// answer is what the upstream said about one request.
+type answer struct {
+	status  int
+	pause   time.Duration // a secondary-limit answer's retry-after
+	backoff bool          // a secondary-limit answer without retry-after
+	ok      bool          // the rate-limit headers below were present
+	// The headers. resource is x-ratelimit-resource, empty if not sent.
+	resource         string
+	limit, remaining int
+	reset            time.Time
 }
 
 // GitHub's published secondary limits, used for any Config field left at zero.
@@ -141,10 +172,7 @@ const (
 	GitHubMinPause    = time.Minute
 )
 
-// New returns a budget that knows nothing yet. Secondary-limit fields left
-// at zero get GitHub's numbers. now and schedule are injected so tests
-// control time; pass time.Now and AfterFunc for real use.
-func New(cfg Config, now func() time.Time, schedule func(time.Duration, func())) *Budget {
+func withDefaults(cfg Config) Config {
 	if cfg.MaxInFlight == 0 {
 		cfg.MaxInFlight = GitHubMaxInFlight
 	}
@@ -157,17 +185,20 @@ func New(cfg Config, now func() time.Time, schedule func(time.Duration, func()))
 	if cfg.MinPause == 0 {
 		cfg.MinPause = GitHubMinPause
 	}
-	return &Budget{cfg: cfg, now: now, schedule: schedule, resources: map[string]*resource{}}
+	return cfg
 }
 
-// resourceLocked returns the named resource, creating it on first use.
-func (b *Budget) resourceLocked(name string) *resource {
-	r := b.resources[name]
-	if r == nil {
-		r = &resource{}
-		b.resources[name] = r
-	}
-	return r
+// New returns a budget kept in this process's memory that knows nothing
+// yet. Secondary-limit fields left at zero get GitHub's numbers. now and
+// schedule are injected so tests control time; pass time.Now and AfterFunc
+// for real use.
+func New(cfg Config, now func() time.Time, schedule func(time.Duration, func())) *Budget {
+	cfg = withDefaults(cfg)
+	return newBudget(cfg, now, schedule, newMemory(cfg, now))
+}
+
+func newBudget(cfg Config, now func() time.Time, schedule func(time.Duration, func()), c counts) *Budget {
+	return &Budget{cfg: cfg, now: now, schedule: schedule, c: c, lines: map[string][]*waiter{}}
 }
 
 // AfterFunc adapts time.AfterFunc to New's schedule parameter.
@@ -185,10 +216,9 @@ func (b *Budget) Acquire(ctx context.Context, res string, write bool) (*Ticket, 
 		cost = WriteCost
 	}
 	b.mu.Lock()
-	r := b.resourceLocked(res)
 	b.arrivals++
-	w := &waiter{arrival: b.arrivals, cost: cost, deadline: b.now().Add(b.cfg.MaxHold), done: make(chan error, 1)}
-	r.waiting = append(r.waiting, w)
+	w := &waiter{arrival: b.arrivals, res: res, cost: cost, deadline: b.now().Add(b.cfg.MaxHold), done: make(chan error, 1)}
+	b.lines[res] = append(b.lines[res], w)
 	// Join the back of the line, then let the line move: w goes now only if
 	// nobody who came earlier can go first.
 	b.drainLocked()
@@ -198,7 +228,7 @@ func (b *Budget) Acquire(ctx context.Context, res string, write bool) (*Ticket, 
 		if err != nil {
 			return nil, err
 		}
-		return &Ticket{b: b, r: r, sp: w.sp}, nil
+		return &Ticket{b: b, l: w.l}, nil
 	default:
 	}
 	b.schedule(b.cfg.MaxHold, b.drain)
@@ -209,106 +239,32 @@ func (b *Budget) Acquire(ctx context.Context, res string, write bool) (*Ticket, 
 		if err != nil {
 			return nil, err
 		}
-		return &Ticket{b: b, r: r, sp: w.sp}, nil
+		return &Ticket{b: b, l: w.l}, nil
 	case <-ctx.Done():
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		for i, x := range r.waiting {
-			if x == w {
-				r.waiting = append(r.waiting[:i], r.waiting[i+1:]...)
-				return nil, ctx.Err()
-			}
+		if i := slices.Index(b.lines[res], w); i >= 0 {
+			b.lines[res] = slices.Delete(b.lines[res], i, i+1)
+			return nil, ctx.Err()
 		}
 		// drain already answered w just as ctx ended. If it admitted w,
 		// give the unit back so nothing is reserved for a request never sent.
 		if err := <-w.done; err == nil {
-			r.reserved--
-			b.inFlight--
-			w.sp.close(b.now()) // never sent; its points simply expire
-			if !r.known {
-				r.probing = false
-			}
+			b.c.cancel(w.l)
 			b.drainLocked()
 		}
 		return nil, ctx.Err()
 	}
 }
 
-// primaryReadyLocked reports whether r's primary budget lets one more
-// request go now: as the probe if r is unknown, or because a unit is left.
-func (r *resource) primaryReadyLocked() bool {
-	if !r.known {
-		return !r.probing
-	}
-	return !r.primaryOutLocked()
-}
-
-// sharedReadyLocked reports whether the token's shared checks (pause,
-// in-flight cap, points) let a request of this cost go now.
-func (b *Budget) sharedReadyLocked(now time.Time, cost int) bool {
-	b.pruneLocked(now)
-	return !now.Before(b.paused) && b.inFlight < b.cfg.MaxInFlight && b.pointsLocked()+cost <= b.cfg.Points
-}
-
-// admitLocked reserves one unit of r, one in-flight slot and cost points.
-// The caller has checked that both primaryReadyLocked and sharedReadyLocked
-// pass.
-func (b *Budget) admitLocked(r *resource, cost int) *spend {
-	if !r.known {
-		r.probing = true // learn first: the rest wait for this one's headers
-	}
-	r.reserved++
-	b.inFlight++
-	sp := &spend{cost: cost}
-	b.spent = append(b.spent, sp)
-	return sp
-}
-
-// primaryOutLocked reports whether the primary budget is used up until the
-// reset: every remaining unit is already reserved.
-func (r *resource) primaryOutLocked() bool {
-	return r.known && r.remaining-r.reserved <= 0
-}
-
-// pruneLocked forgets points of requests answered more than PointsWindow ago.
-func (b *Budget) pruneLocked(now time.Time) {
-	b.spent = slices.DeleteFunc(b.spent, func(s *spend) bool {
-		return !s.answered.IsZero() && !s.answered.Add(b.cfg.PointsWindow).After(now)
-	})
-}
-
-func (b *Budget) pointsLocked() int {
-	n := 0
-	for _, s := range b.spent {
-		n += s.cost
-	}
-	return n
-}
-
-// rollLocked starts a new window once the old one's reset (plus the guard)
-// has passed. We assume the full limit until a response says otherwise.
-func (r *resource) rollLocked(now time.Time, guard time.Duration) {
-	if r.known && !r.reset.IsZero() && !now.Before(r.reset.Add(guard)) {
-		r.remaining = r.limit
-		r.reset = time.Time{}
-	}
-}
-
-// tooLongLocked reports whether a request that can't be sent now would
-// wait past deadline. It refuses early only when a known wait (the primary
-// reset, or a pause) already runs past the deadline; waits for in-flight
-// answers or for points to expire are short, so those requests stay until
-// their deadline.
-func (b *Budget) tooLongLocked(r *resource, now, deadline time.Time) error {
-	release := b.paused
-	if r.primaryOutLocked() && !r.reset.IsZero() {
-		release = laterOf(release, r.reset.Add(b.cfg.ResetGuard))
-	}
-	if release.After(deadline) {
-		return &TooLongError{RetryAfter: ceilSeconds(release.Sub(now))}
-	}
-	if !now.Before(deadline) {
-		return &TooLongError{RetryAfter: ceilSeconds(release.Sub(now))}
+// tooLong reports whether a request that can't be sent now would wait past
+// deadline. It refuses early only when a known wait (the primary reset, or
+// a pause) already runs past the deadline; waits for in-flight answers or
+// for points to expire are short, so those requests stay until their
+// deadline.
+func tooLong(now, deadline time.Time, release time.Duration) error {
+	if (release > 0 && now.Add(release).After(deadline)) || !now.Before(deadline) {
+		return &TooLongError{RetryAfter: ceilSeconds(release)}
 	}
 	return nil
 }
@@ -320,30 +276,11 @@ func laterOf(a, b time.Time) time.Time {
 	return a
 }
 
-// scheduleLocked makes sure held requests are looked at again at the next
-// moment a check can start passing on its own: a held resource's primary
-// reset, the end of a pause, or the oldest points leaving the window.
-// (In-flight answers wake the lines themselves.)
-func (b *Budget) scheduleLocked(now time.Time) {
-	var at time.Time
-	consider := func(t time.Time) {
-		if t.After(now) && (at.IsZero() || t.Before(at)) {
-			at = t
-		}
-	}
-	for _, r := range b.resources {
-		if len(r.waiting) > 0 && r.known && !r.reset.IsZero() {
-			consider(r.reset.Add(b.cfg.ResetGuard))
-		}
-	}
-	consider(b.paused)
-	for _, s := range b.spent {
-		if !s.answered.IsZero() {
-			consider(s.answered.Add(b.cfg.PointsWindow))
-		}
-	}
-	if at.IsZero() || (!b.timerAt.IsZero() && !at.Before(b.timerAt)) {
-		return // nothing to wait for, or a timer at or before it is already set
+// scheduleLocked makes sure held requests are looked at again at the
+// moment at, unless a timer at or before it is already set.
+func (b *Budget) scheduleLocked(now, at time.Time) {
+	if !b.timerAt.IsZero() && !at.Before(b.timerAt) {
+		return
 	}
 	b.timerAt = at
 	b.schedule(at.Sub(now), func() {
@@ -367,50 +304,59 @@ func (b *Budget) drain() {
 // budget goes next; if the shared checks stop it, nobody behind it jumps
 // ahead.
 func (b *Budget) drainLocked() {
+	// One merged list, oldest first. No more than MaxInFlight per line can
+	// go at once, so the rest of a long line needn't be asked about.
+	var ws []*waiter
+	for _, line := range b.lines {
+		ws = append(ws, line[:min(len(line), b.cfg.MaxInFlight)]...)
+	}
+	if len(ws) == 0 {
+		return
+	}
+	slices.SortFunc(ws, func(x, y *waiter) int { return cmp.Compare(x.arrival, y.arrival) })
+	wants := make([]want, len(ws))
+	for i, w := range ws {
+		wants[i] = want{w.res, w.cost}
+	}
+	g := b.c.admit(wants)
+	for i, w := range ws {
+		if g.leases[i] != nil {
+			w.l = g.leases[i]
+			w.done <- nil
+		}
+	}
+
 	now := b.now()
-	for _, r := range b.resources {
-		r.rollLocked(now, b.cfg.ResetGuard)
-	}
-	for {
-		var next *resource
-		for _, r := range b.resources {
-			if len(r.waiting) > 0 && r.primaryReadyLocked() && (next == nil || r.waiting[0].arrival < next.waiting[0].arrival) {
-				next = r
-			}
-		}
-		if next == nil || !b.sharedReadyLocked(now, next.waiting[0].cost) {
-			break
-		}
-		w := next.waiting[0]
-		w.sp = b.admitLocked(next, w.cost)
-		w.done <- nil
-		next.waiting[0] = nil
-		next.waiting = next.waiting[1:]
-	}
 	held := false
-	for _, r := range b.resources {
-		kept := r.waiting[:0]
-		for _, w := range r.waiting {
-			if err := b.tooLongLocked(r, now, w.deadline); err != nil {
+	for res, line := range b.lines {
+		kept := line[:0]
+		for _, w := range line {
+			if w.l != nil {
+				continue
+			}
+			if err := tooLong(now, w.deadline, g.release[res]); err != nil {
 				w.done <- err
 				continue
 			}
 			kept = append(kept, w)
 		}
-		clear(r.waiting[len(kept):])
-		r.waiting = kept
-		held = held || len(kept) > 0
+		clear(line[len(kept):])
+		if len(kept) == 0 {
+			delete(b.lines, res)
+			continue
+		}
+		b.lines[res] = kept
+		held = true
 	}
-	if held {
-		b.scheduleLocked(now)
+	if held && g.wake > 0 {
+		b.scheduleLocked(now, now.Add(g.wake))
 	}
 }
 
 // Ticket is one admitted request's reservation.
 type Ticket struct {
 	b    *Budget
-	r    *resource // the resource it was admitted against
-	sp   *spend
+	l    lease
 	once sync.Once
 }
 
@@ -422,88 +368,45 @@ type Ticket struct {
 // request on the token. A response without rate-limit headers counts as
 // Failed, apart from any pause it asks for.
 func (t *Ticket) Done(status int, h http.Header) {
-	t.b.secondary(status, h)
-	limit, err1 := strconv.Atoi(h.Get("x-ratelimit-limit"))
-	remaining, err2 := strconv.Atoi(h.Get("x-ratelimit-remaining"))
-	reset, err3 := strconv.ParseInt(h.Get("x-ratelimit-reset"), 10, 64)
-	if errors.Join(err1, err2, err3) != nil {
-		t.Failed()
-		return
+	a := answer{status: status}
+	// Secondary limits, in GitHub's order: use retry-after if given; if
+	// primary budget is at 0, the primary rules already hold that resource
+	// until its reset; otherwise pause MinPause, doubling for each such
+	// answer in a row.
+	remaining := h.Get("x-ratelimit-remaining")
+	if status == http.StatusTooManyRequests || (status == http.StatusForbidden && remaining != "0" && remaining != "") {
+		if s, err := strconv.Atoi(h.Get("retry-after")); err == nil && s > 0 {
+			a.pause = time.Duration(s) * time.Second
+		} else if remaining != "0" {
+			a.backoff = true
+		}
 	}
-	t.once.Do(func() {
-		b := t.b
-		b.mu.Lock()
-		defer b.mu.Unlock()
-		t.sp.close(b.now())
-		t.r.reserved--
-		t.r.probing = false
-		b.inFlight--
-		if status < 300 {
-			b.streak = 0
-		}
-		r := t.r
-		if name := h.Get("x-ratelimit-resource"); name != "" {
-			r = b.resourceLocked(name)
-		}
-		r.known = true
-		r.limit = limit
-		switch rs := time.Unix(reset, 0); {
-		case r.reset.IsZero() || rs.After(r.reset):
-			// A window we haven't seen yet: take its count as is.
-			r.reset = rs
-			r.remaining = remaining
-		case rs.Equal(r.reset):
-			r.remaining = min(r.remaining, remaining)
-		default:
-			// A late answer from an older window says nothing about this one.
-		}
-		b.drainLocked()
-	})
+	limit, err1 := strconv.Atoi(h.Get("x-ratelimit-limit"))
+	rem, err2 := strconv.Atoi(remaining)
+	reset, err3 := strconv.ParseInt(h.Get("x-ratelimit-reset"), 10, 64)
+	if errors.Join(err1, err2, err3) == nil {
+		a.ok = true
+		a.resource = h.Get("x-ratelimit-resource")
+		a.limit, a.remaining, a.reset = limit, rem, time.Unix(reset, 0)
+	}
+	t.finish(a)
 }
 
 // Failed releases the reservation for a request whose upstream gave no
 // usable answer (a timeout, a dropped connection). The upstream may still
 // have counted it, so the unit stays spent until a response corrects us.
 func (t *Ticket) Failed() {
+	t.finish(answer{})
+}
+
+func (t *Ticket) finish(a answer) {
 	t.once.Do(func() {
 		b := t.b
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		t.sp.close(b.now())
-		t.r.reserved--
-		b.inFlight--
-		if t.r.known {
-			t.r.remaining--
-		} else {
-			t.r.probing = false // let the next request try to learn the budget
-		}
+		b.c.answer(t.l, a)
 		b.drainLocked()
 	})
-}
-
-// secondary pauses the token after a secondary-limit answer, following
-// GitHub's order: use retry-after if given; if primary budget is at 0, the
-// primary rules already hold that resource until its reset; otherwise wait
-// MinPause, doubling for each such answer in a row.
-func (b *Budget) secondary(status int, h http.Header) {
-	remaining := h.Get("x-ratelimit-remaining")
-	if status != http.StatusTooManyRequests && (status != http.StatusForbidden || remaining == "0" || remaining == "") {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	now := b.now()
-	var wait time.Duration
-	if s, err := strconv.Atoi(h.Get("retry-after")); err == nil && s > 0 {
-		wait = time.Duration(s) * time.Second
-	} else if remaining == "0" {
-		return
-	} else {
-		wait = b.cfg.MinPause << min(b.streak, 10)
-		b.streak++
-	}
-	b.paused = laterOf(b.paused, now.Add(wait))
-	b.scheduleLocked(now)
 }
 
 func ceilSeconds(d time.Duration) int {
